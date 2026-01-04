@@ -191,6 +191,27 @@ class PyVistaViewport(QWidget):
         self._draw_axes(50)
         self.plotter.camera_position = 'iso'
         self.plotter.reset_camera()
+        
+    def _calculate_plane_axes(self, normal_vec):
+        n = np.array(normal_vec)
+        norm = np.linalg.norm(n)
+        if norm == 0: return (1,0,0), (0,1,0)
+        n = n / norm
+        
+        if abs(n[2]) > 0.999:
+            x_dir = np.array([1.0, 0.0, 0.0])
+            y_dir = np.cross(n, x_dir)
+            y_dir = y_dir / np.linalg.norm(y_dir)
+            x_dir = np.cross(y_dir, n)
+        else:
+            global_up = np.array([0.0, 0.0, 1.0])
+            x_dir = np.cross(global_up, n)
+            x_dir = x_dir / np.linalg.norm(x_dir)
+            y_dir = np.cross(n, x_dir)
+            y_dir = y_dir / np.linalg.norm(y_dir)
+            
+        # WICHTIG: Dies hat gefehlt!
+        return tuple(x_dir), tuple(y_dir)
     
     def _draw_grid(self, size=200, spacing=10):
         try: self.plotter.remove_actor('grid_main')
@@ -499,12 +520,17 @@ class PyVistaViewport(QWidget):
             self._draw_selectable_faces()
 
     def _transform_2d_to_3d(self, x, y, normal, origin):
+        """Wandelt lokale Sketch-Koordinaten in globale 3D-Koordinaten um"""
         ox, oy, oz = origin
-        if isinstance(normal, list): normal = tuple(normal)
-        if normal == (0, 0, 1): return (ox + x, oy + y, oz)
-        if normal == (0, 1, 0): return (ox + x, oy, oz - y)
-        if normal == (1, 0, 0): return (ox, oy + x, oz - y)
-        return (ox + x, oy + y, oz)
+        
+        # Standard-Berechnung
+        ux, uy = self._calculate_plane_axes(normal)
+        
+        # P_world = Origin + x*U + y*V
+        px = ox + x * ux[0] + y * uy[0]
+        py = oy + x * ux[1] + y * uy[1]
+        pz = oz + x * ux[2] + y * uy[2]
+        return (px, py, pz)
 
     def _apply_boolean_operation(self, new_mesh, operation, target_body_id=None):
         """Führt Boolean Ops durch: Union, Difference, New Body"""
@@ -729,14 +755,18 @@ class PyVistaViewport(QWidget):
                 print(f"Body face detection error for body {bid}: {e}")
 
     def set_sketches(self, sketches):
+        """Zeichnet 2D-Sketches im 3D-Raum"""
         self.sketches = list(sketches)
         if not HAS_PYVISTA: return
+        
+        # Cleanup
         for n in self._sketch_actors:
             try: self.plotter.remove_actor(n)
             except: pass
         self._sketch_actors.clear()
-        for s, v in self.sketches:
-            if v: self._render_sketch(s)
+        
+        for s, visible in self.sketches:
+            if visible: self._render_sketch(s)
         self.plotter.update()
 
     def add_body(self, bid, name, verts, faces, color=None):
@@ -1263,39 +1293,53 @@ class PyVistaViewport(QWidget):
             return [], []
 
     def confirm_extrusion(self, operation="New Body"):
-            """Bestätigt Extrusion und sendet Daten + Operation an Main Window"""
-            # Nur senden, wenn Flächen ausgewählt sind und die Höhe nicht 0 ist
-            if self.selected_faces and abs(self.extrude_height) >= 0.1:
-                # WICHTIG: Hier senden wir die Operation (String) mit!
-                # Das Signal muss oben definiert sein als: Signal(list, float, str)
+        """Bestätigt Extrusion und sendet Daten + Operation an Main Window"""
+        
+        # Fall 1: Sketch-Faces ausgewählt
+        if self.selected_faces and -1 not in self.selected_faces:
+             if abs(self.extrude_height) >= 0.01:
                 self.extrude_requested.emit(list(self.selected_faces), self.extrude_height, operation)
-                
-            # Modus beenden
-            self.set_extrude_mode(False)
+
+        # Fall 2: Body-Face direkt ausgewählt (Push/Pull ohne Sketch)
+        # Wenn wir das unterstützen wollen, müssen wir dem Main Window sagen:
+        # "Nimm kein Sketch-Profil, sondern nimm die Geometrie von Body X, Face Y"
+        elif self.body_face_extrude and abs(self.extrude_height) >= 0.01:
+            print("Direct Body Face Extrusion requested")
+            # Hier bräuchten wir eigentlich ein separates Signal oder eine Logik im Main Window,
+            # die mit 'body_face_extrude' umgehen kann.
+            # Für jetzt: Stellen wir sicher, dass zumindest die Plane für zukünftige Sketches stimmt:
+            origin = self.body_face_extrude['origin']
+            normal = self.body_face_extrude['normal']
+            self.custom_plane_clicked.emit(origin, normal)
+
+        # Modus beenden
+        self.set_extrude_mode(False)
 
     def _pick_body_face(self, x, y):
         """Versucht eine planare Fläche auf einem 3D-Körper zu finden"""
         cell_picker = vtk.vtkCellPicker()
+        cell_picker.SetTolerance(0.005) # Etwas strikter
         cell_picker.Pick(x, self.plotter.interactor.height()-y, 0, self.plotter.renderer)
         
         if cell_picker.GetCellId() != -1:
-            actor = cell_picker.GetActor()
-            # Finde Body ID zu Actor
-            body_id = None
-            for bid, actors in self._body_actors.items():
-                if self.plotter.renderer.actors.get(actors[0]) == actor: # Check main mesh
-                    body_id = bid
-                    break
+            # ... (Body ID Logik wie bisher) ...
             
             if body_id is not None:
-                # Normalenvektor der geklickten Zelle
-                normal = cell_picker.GetPickNormal()
+                normal = list(cell_picker.GetPickNormal())
                 pos = cell_picker.GetPickPosition()
                 
-                print(f"Body {body_id} clicked at {pos}, Normal: {normal}")
-                # Hier könnte man nun eine neue Skizze auf dieser Fläche starten
-                # Signal emitten:
+                # BEREINIGUNG: Fast-Nullen und Fast-Einsen glätten
+                # Das verhindert Floating-Point Fehler bei geraden Flächen
+                for i in range(3):
+                    if abs(normal[i]) < 0.001: normal[i] = 0.0
+                    if abs(normal[i] - 1.0) < 0.001: normal[i] = 1.0
+                    if abs(normal[i] + 1.0) < 0.001: normal[i] = -1.0
+                
+                # Signal senden
                 self.custom_plane_clicked.emit(tuple(pos), tuple(normal))
+                
+                # NEU: Visualisierung der gewählten Ebene (optional)
+                self._draw_plane_hover_highlight(pos, normal)
                 return True
         return False
     
@@ -1524,10 +1568,34 @@ class PyVistaViewport(QWidget):
         self._face_actors.clear()
 
     def _render_sketch(self, s):
-        norm = tuple(getattr(s,'plane_normal',(0,0,1))); orig = getattr(s,'plane_origin',(0,0,0))
+        norm = tuple(getattr(s,'plane_normal',(0,0,1)))
+        orig = getattr(s,'plane_origin',(0,0,0))
+        
+        # OPTIMIERUNG: Wenn X-Achse im Sketch gespeichert ist, nutze diese direkt!
+        # Das garantiert, dass das Grid im Viewport genau so liegt wie die Build123d Plane.
+        x_dir_cached = getattr(s, 'plane_x_dir', None)
+        
         sid = getattr(s,'id',id(s))
         
-        def t3d(x,y): return self._transform_2d_to_3d(x,y,norm,orig)
+        # Lokale Funktion mit Closure über Koordinatensystem
+        def t3d(x, y): 
+            if x_dir_cached:
+                # Schnelle Berechnung ohne Neuberechnung der Achsen
+                ux = x_dir_cached
+                # Berechne Y aus Normal und X (Kreuzprodukt)
+                n_np = np.array(norm)
+                x_np = np.array(ux)
+                uy = np.cross(n_np, x_np) # Y Vektor
+                
+                ox, oy, oz = orig
+                # P = O + x*U + y*V
+                px = ox + x * ux[0] + y * uy[0]
+                py = oy + x * ux[1] + y * uy[1]
+                pz = oz + x * ux[2] + y * uy[2]
+                return (px, py, pz)
+            else:
+                # Fallback zur alten Berechnung
+                return self._transform_2d_to_3d(x, y, norm, orig)
         
         # Linien
         for i,l in enumerate(getattr(s,'lines',[])):

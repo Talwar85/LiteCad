@@ -7,6 +7,7 @@ import sys
 import os
 import json
 import math
+import numpy as np
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -106,7 +107,33 @@ class MainWindow(QMainWindow):
                 border-top: 1px solid #333;
             }
         """)
-
+        
+    def _calculate_plane_axes(self, normal_vec):
+        """
+        Berechnet stabile X- und Y-Achsen für eine Ebene basierend auf der Normalen.
+        Muss IDENTISCH zu viewport_pyvista.py sein!
+        """
+        n = np.array(normal_vec)
+        norm = np.linalg.norm(n)
+        if norm == 0: return (1,0,0), (0,1,0)
+        n = n / norm
+        
+        # Globale Up-Vektor Strategie (Z-Up)
+        if abs(n[2]) > 0.999:
+            # Normale ist (0,0,1) oder (0,0,-1)
+            x_dir = np.array([1.0, 0.0, 0.0])
+            y_dir = np.cross(n, x_dir)
+            y_dir = y_dir / np.linalg.norm(y_dir)
+            x_dir = np.cross(y_dir, n)
+        else:
+            global_up = np.array([0.0, 0.0, 1.0])
+            x_dir = np.cross(global_up, n)
+            x_dir = x_dir / np.linalg.norm(x_dir)
+            y_dir = np.cross(n, x_dir)
+            y_dir = y_dir / np.linalg.norm(y_dir)
+            
+        return tuple(x_dir), tuple(y_dir)
+        
     def _create_ui(self):
         central = QWidget()
         central.setStyleSheet("background-color: #1e1e1e;")
@@ -409,8 +436,18 @@ class MainWindow(QMainWindow):
 
     def _create_sketch_at(self, origin, normal):
         s = self.document.new_sketch(f"Sketch{len(self.document.sketches)+1}")
-        s.plane_origin = origin; s.plane_normal = normal
-        self.active_sketch = s; self.sketch_editor.sketch = s
+        
+        # Berechne die lokalen Achsen, damit Viewport und Build123d synchron sind
+        x_dir, y_dir = self._calculate_plane_axes(normal)
+        
+        # Speichere ALLE Orientierungsdaten im Sketch Objekt
+        s.plane_origin = origin
+        s.plane_normal = normal
+        s.plane_x_dir = x_dir # WICHTIG für Build123d
+        s.plane_y_dir = y_dir
+        
+        self.active_sketch = s
+        self.sketch_editor.sketch = s
         
         # Bodies als Referenz an SketchEditor übergeben
         self._set_sketch_body_references(origin, normal)
@@ -441,6 +478,11 @@ class MainWindow(QMainWindow):
         # Body-Referenzen im SketchEditor löschen
         if hasattr(self.sketch_editor, 'set_reference_bodies'):
             self.sketch_editor.set_reference_bodies([], (0,0,1), (0,0,0))
+            
+        # WICHTIG: Aktiven Sketch zurücksetzen, damit im 3D-Modus 
+        # keine Verwechslung bei der Extrusion passiert!
+        self.active_sketch = None
+        
         self._set_mode("3d"); self.browser.refresh()
 
     def _extrude_dialog(self):
@@ -494,13 +536,24 @@ class MainWindow(QMainWindow):
         self.viewport_3d.set_all_bodies_visible(not hide)
 
     def _on_extrusion_finished(self, face_indices, height, operation="New Body"):
-        if not face_indices or abs(height) < 0.1:
+        if not face_indices or abs(height) < 0.001:
             self.extrude_panel.setVisible(False)
             self.viewport_3d.set_all_bodies_visible(True)
             return
         
-        # Versuche Build123d Extrusion für bessere Qualität
-        if HAS_BUILD123D and self.active_sketch:
+        # Prüfen: Ist die gewählte Fläche eine Körper-Fläche (Body Face)?
+        is_body_face = False
+        if hasattr(self.viewport_3d, 'detected_faces'):
+            # Wir prüfen die erste gewählte Fläche
+            idx = face_indices[0]
+            if 0 <= idx < len(self.viewport_3d.detected_faces):
+                face_data = self.viewport_3d.detected_faces[idx]
+                if face_data.get('type') == 'body_face':
+                    is_body_face = True
+
+        # 1. Build123d Pfad (NUR für Sketches verwenden!)
+        # Wir überspringen diesen Block, wenn es eine Body-Face ist.
+        if HAS_BUILD123D and self.active_sketch and not is_body_face:
             success = self._extrude_with_build123d(face_indices, height, operation)
             if success:
                 self.extrude_panel.setVisible(False)
@@ -509,7 +562,9 @@ class MainWindow(QMainWindow):
                 self.browser.refresh()
                 return
         
-        # Fallback: PyVista-basierte Extrusion
+        # 2. Fallback / Body Face Pfad
+        # Dieser Pfad nutzt die Geometrie der Vorschau (PyVista).
+        # Da die blaue Vorschau im Bild korrekt ist, wird auch dieser Pfad das richtige Ergebnis liefern.
         if hasattr(self.viewport_3d, 'get_extrusion_data'):
             for idx in face_indices:
                 verts, faces = self.viewport_3d.get_extrusion_data(idx, height)
