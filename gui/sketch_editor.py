@@ -1,6 +1,7 @@
 """
 LiteCAD - 2D Sketch Editor v4
 Fusion360-Style mit Tab-Eingabe, geschlossene Profile, professionelle UX
+Mit Build123d Backend für parametrische CAD-Operationen
 """
 
 from PySide6.QtWidgets import (
@@ -24,6 +25,24 @@ if _project_root not in sys.path:
 
 from i18n import tr
 from sketcher import Sketch, Point2D, Line2D, Circle2D, Arc2D, Constraint, ConstraintType
+
+# Build123d für parametrische CAD-Operationen
+HAS_BUILD123D = False
+try:
+    import build123d as b3d
+    from build123d import (
+        BuildPart, BuildSketch, BuildLine,
+        Plane, Location, Locations, Vector,
+        Line as B3DLine, Circle as B3DCircle, 
+        CenterArc, ThreePointArc, TangentArc,
+        Rectangle, Polygon, Polyline,
+        extrude, fillet, chamfer, make_face,
+        Mode
+    )
+    HAS_BUILD123D = True
+    print("✓ Build123d erfolgreich geladen für Sketch-Editor")
+except ImportError as e:
+    print(f"! Build123d nicht verfügbar: {e}")
 
 # Importiere Dialoge und Tools - mehrere Fallback-Versuche
 _import_ok = False
@@ -904,6 +923,280 @@ class SketchEditor(QWidget, SketchHandlersMixin, SketchRendererMixin):
             
         except Exception as e:
             self.status_message.emit(tr("DXF export error: {e}").format(e=e))
+    
+    # ==================== BUILD123D INTEGRATION ====================
+    
+    def get_build123d_plane(self):
+        """Gibt die Build123d Plane für diesen Sketch zurück"""
+        if not HAS_BUILD123D:
+            return None
+        
+        # Hole Plane-Daten vom Sketch
+        origin = getattr(self.sketch, 'plane_origin', (0, 0, 0))
+        normal = getattr(self.sketch, 'plane_normal', (0, 0, 1))
+        
+        ox, oy, oz = origin
+        nx, ny, nz = normal
+        
+        # Standard-Ebenen erkennen
+        if abs(nz - 1) < 0.01 and abs(nx) < 0.01 and abs(ny) < 0.01:
+            return Plane.XY.offset(oz)
+        elif abs(ny - 1) < 0.01 and abs(nx) < 0.01 and abs(nz) < 0.01:
+            return Plane.XZ.offset(oy)
+        elif abs(nx - 1) < 0.01 and abs(ny) < 0.01 and abs(nz) < 0.01:
+            return Plane.YZ.offset(ox)
+        else:
+            # Custom Plane
+            return Plane(origin=(ox, oy, oz), z_dir=(nx, ny, nz))
+    
+    def get_build123d_sketch(self, plane=None):
+        """
+        Konvertiert den aktuellen Sketch zu einem Build123d BuildSketch.
+        
+        Returns:
+            BuildSketch oder None wenn Build123d nicht verfügbar
+        """
+        if not HAS_BUILD123D:
+            print("Build123d nicht verfügbar!")
+            return None
+        
+        if plane is None:
+            plane = self.get_build123d_plane()
+        
+        try:
+            # Sammle alle nicht-construction Geometrie
+            lines = [l for l in self.sketch.lines if not l.construction]
+            circles = [c for c in self.sketch.circles if not c.construction]
+            arcs = [a for a in self.sketch.arcs if not a.construction]
+            
+            if not lines and not circles and not arcs:
+                print("Keine Geometrie im Sketch!")
+                return None
+            
+            # Erstelle Build123d Sketch
+            with BuildSketch(plane) as sketch:
+                # Linien hinzufügen
+                for line in lines:
+                    with BuildLine():
+                        B3DLine(
+                            (line.start.x, line.start.y),
+                            (line.end.x, line.end.y)
+                        )
+                
+                # Kreise hinzufügen - mit Locations für Position
+                for circle in circles:
+                    with Locations([(circle.center.x, circle.center.y)]):
+                        B3DCircle(radius=circle.radius)
+                
+                # Arcs hinzufügen (als CenterArc)
+                for arc in arcs:
+                    start_deg = arc.start_angle
+                    end_deg = arc.end_angle
+                    
+                    # Berechne arc_size (Sweep)
+                    arc_size = end_deg - start_deg
+                    if arc_size < 0:
+                        arc_size += 360
+                    
+                    with BuildLine():
+                        CenterArc(
+                            center=(arc.center.x, arc.center.y),
+                            radius=arc.radius,
+                            start_angle=start_deg,
+                            arc_size=arc_size
+                        )
+                
+                # Faces erzeugen aus den Linien
+                make_face()
+            
+            return sketch
+            
+        except Exception as e:
+            print(f"Build123d Sketch Konvertierung fehlgeschlagen: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def get_build123d_part(self, height: float, operation: str = "New Body"):
+        """
+        Erstellt ein extrudiertes Build123d Part aus dem Sketch.
+        
+        Args:
+            height: Extrusionshöhe in mm
+            operation: "New Body", "Join", "Cut", "Intersect"
+            
+        Returns:
+            (Part, mesh_verts, mesh_faces) oder (None, None, None)
+        """
+        if not HAS_BUILD123D:
+            print("Build123d nicht verfügbar!")
+            return None, None, None
+        
+        # Stelle sicher dass Profile aktuell sind
+        self._find_closed_profiles()
+        
+        plane = self.get_build123d_plane()
+        print(f"Build123d Part: height={height}, plane={plane}")
+        print(f"  Profiles: {len(self.closed_profiles)}, Lines: {len(self.sketch.lines)}, Circles: {len(self.sketch.circles)}")
+        
+        try:
+            # Versuche aus Profilen zu erstellen
+            result = self._build123d_from_profiles(height, plane)
+            if result[0] is not None:
+                return result
+            
+            # Fallback: Direkt aus Sketch-Geometrie
+            print("Build123d: Fallback zu direkter Geometrie-Erstellung")
+            return self._build123d_direct(height, plane)
+            
+        except Exception as e:
+            print(f"Build123d Part Erstellung fehlgeschlagen: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None, None
+    
+    def _build123d_direct(self, height: float, plane):
+        """Erstellt Build123d Part direkt aus Sketch-Linien (Fallback)"""
+        if not HAS_BUILD123D:
+            return None, None, None
+        
+        lines = [l for l in self.sketch.lines if not l.construction]
+        circles = [c for c in self.sketch.circles if not c.construction]
+        
+        if not lines and not circles:
+            print("Build123d: Keine Geometrie!")
+            return None, None, None
+        
+        try:
+            with BuildPart() as part:
+                with BuildSketch(plane):
+                    # Versuche Rechteck zu erkennen (4 Linien, geschlossen)
+                    if len(lines) == 4 and not circles:
+                        # Sammle alle Endpunkte
+                        points = set()
+                        for l in lines:
+                            points.add((round(l.start.x, 4), round(l.start.y, 4)))
+                            points.add((round(l.end.x, 4), round(l.end.y, 4)))
+                        
+                        if len(points) == 4:
+                            # Es ist ein Rechteck!
+                            pts = list(points)
+                            xs = [p[0] for p in pts]
+                            ys = [p[1] for p in pts]
+                            min_x, max_x = min(xs), max(xs)
+                            min_y, max_y = min(ys), max(ys)
+                            width = max_x - min_x
+                            height_rect = max_y - min_y
+                            center_x = (min_x + max_x) / 2
+                            center_y = (min_y + max_y) / 2
+                            
+                            print(f"  Rechteck erkannt: {width}x{height_rect} at ({center_x}, {center_y})")
+                            
+                            with Locations([(center_x, center_y)]):
+                                Rectangle(width, height_rect)
+                    
+                    # Kreise hinzufügen
+                    for circle in circles:
+                        print(f"  Kreis: r={circle.radius} at ({circle.center.x}, {circle.center.y})")
+                        with Locations([(circle.center.x, circle.center.y)]):
+                            B3DCircle(radius=circle.radius)
+                
+                extrude(amount=height)
+            
+            solid = part.part
+            if solid is None:
+                return None, None, None
+            
+            print(f"Build123d Direct: Solid erstellt!")
+            
+            mesh_data = solid.tessellate(tolerance=0.1)
+            verts = [(v.X, v.Y, v.Z) for v in mesh_data[0]]
+            faces = [tuple(t) for t in mesh_data[1]]
+            
+            return solid, verts, faces
+            
+        except Exception as e:
+            print(f"Build123d Direct fehlgeschlagen: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None, None
+    
+    def _build123d_from_profiles(self, height: float, plane):
+        """Erstellt Build123d Part aus geschlossenen Shapely-Profilen"""
+        if not HAS_BUILD123D:
+            return None, None, None
+        
+        # Debug: Zeige was wir haben
+        print(f"Build123d: {len(self.closed_profiles)} geschlossene Profile gefunden")
+        print(f"Build123d: {len(self.sketch.lines)} Linien, {len(self.sketch.circles)} Kreise")
+        
+        if not self.closed_profiles and not self.sketch.circles:
+            print("Build123d: Keine Profile oder Kreise!")
+            return None, None, None
+        
+        try:
+            with BuildPart() as part:
+                with BuildSketch(plane):
+                    created_something = False
+                    
+                    # Methode 1: Aus Shapely Profilen - verwende Polygon!
+                    for i, profile in enumerate(self.closed_profiles):
+                        if hasattr(profile, 'exterior'):
+                            coords = list(profile.exterior.coords)
+                            print(f"  Profil {i}: {len(coords)} Koordinaten")
+                            
+                            if len(coords) >= 4:  # Mindestens 3 Punkte + Schließpunkt
+                                # Entferne Schließpunkt wenn vorhanden
+                                pts = [(float(c[0]), float(c[1])) for c in coords]
+                                if len(pts) > 1 and pts[0] == pts[-1]:
+                                    pts = pts[:-1]
+                                
+                                print(f"    Punkte: {pts}")
+                                
+                                if len(pts) >= 3:
+                                    # Polygon erstellt direkt ein Face!
+                                    Polygon(*pts)
+                                    created_something = True
+                                    print(f"    -> Polygon erstellt")
+                    
+                    # Methode 2: Kreise
+                    circles = [c for c in self.sketch.circles if not c.construction]
+                    for circle in circles:
+                        print(f"  Kreis: center=({circle.center.x}, {circle.center.y}), r={circle.radius}")
+                        with Locations([(circle.center.x, circle.center.y)]):
+                            B3DCircle(radius=circle.radius)
+                        created_something = True
+                    
+                    if not created_something:
+                        print("Build123d: Nichts erstellt in BuildSketch!")
+                        return None, None, None
+                
+                # Extrudieren
+                extrude(amount=height)
+            
+            solid = part.part
+            if solid is None:
+                print("Build123d: Part ist None nach Extrusion")
+                return None, None, None
+            
+            print(f"Build123d: Solid erstellt mit {len(solid.faces())} Faces")
+            
+            # Tessellieren
+            mesh_data = solid.tessellate(tolerance=0.1)
+            verts = [(v.X, v.Y, v.Z) for v in mesh_data[0]]
+            faces = [tuple(t) for t in mesh_data[1]]
+            
+            return solid, verts, faces
+            
+        except Exception as e:
+            print(f"Build123d Profile Extrusion fehlgeschlagen: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None, None
+    
+    def has_build123d(self) -> bool:
+        """Prüft ob Build123d verfügbar ist"""
+        return HAS_BUILD123D
     
     def set_tool(self, tool):
         self._cancel_tool()

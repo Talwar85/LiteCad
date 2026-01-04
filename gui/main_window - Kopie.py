@@ -524,15 +524,68 @@ class MainWindow(QMainWindow):
     def _extrude_with_build123d(self, face_indices, height, operation):
         """Extrudiert mit Build123d für echte BREP-Geometrie"""
         try:
-            # Prüfe ob sketch_editor Build123d unterstützt
-            if not hasattr(self, 'sketch_editor') or not self.sketch_editor.has_build123d():
+            from build123d import (
+                BuildPart, BuildSketch, Plane, extrude,
+                Line, Circle, Arc, Polyline, make_face,
+                Location, Vector, fillet, chamfer
+            )
+            import numpy as np
+            
+            if not self.active_sketch:
                 return False
             
-            # Hole Build123d Part vom Sketch-Editor
-            solid, verts, faces = self.sketch_editor.get_build123d_part(height, operation)
+            sketch = self.active_sketch
+            plane_origin = getattr(sketch, 'plane_origin', (0, 0, 0))
+            plane_normal = getattr(sketch, 'plane_normal', (0, 0, 1))
             
-            if solid is None:
-                print("Build123d: Part-Erstellung fehlgeschlagen")
+            # Bestimme Build123d Plane
+            ox, oy, oz = plane_origin
+            nx, ny, nz = plane_normal
+            
+            if abs(nz - 1) < 0.01:
+                b3d_plane = Plane.XY.offset(oz)
+            elif abs(ny - 1) < 0.01:
+                b3d_plane = Plane.XZ.offset(oy)
+            elif abs(nx - 1) < 0.01:
+                b3d_plane = Plane.YZ.offset(ox)
+            else:
+                b3d_plane = Plane(origin=(ox, oy, oz), z_dir=(nx, ny, nz))
+            
+            # Sammle geschlossene Profile aus dem Sketch
+            profiles = self.viewport_3d.closed_profiles if hasattr(self.viewport_3d, 'closed_profiles') else []
+            
+            if not profiles and hasattr(self, 'sketch_editor'):
+                profiles = self.sketch_editor.closed_profiles
+            
+            if not profiles:
+                print("Build123d: Keine geschlossenen Profile gefunden")
+                return False
+            
+            # Erstelle Build123d Part
+            with BuildPart() as part:
+                with BuildSketch(b3d_plane):
+                    # Konvertiere Profile zu Build123d
+                    for profile in profiles:
+                        if hasattr(profile, 'exterior'):
+                            # Shapely Polygon
+                            coords = list(profile.exterior.coords)
+                            if len(coords) > 2:
+                                pts = [(c[0], c[1]) for c in coords[:-1]]  # Ohne letzten Punkt (=erster)
+                                Polyline(*pts, close=True)
+                        elif isinstance(profile, (list, tuple)):
+                            # Liste von Punkten
+                            if len(profile) > 2:
+                                Polyline(*profile, close=True)
+                    
+                    make_face()
+                
+                # Extrudieren
+                extrude(amount=height)
+            
+            solid = part.part
+            
+            if solid is None or not hasattr(solid, 'vertices'):
+                print("Build123d: Extrusion fehlgeschlagen")
                 return False
             
             # Boolean Operation wenn nötig
@@ -565,9 +618,6 @@ class MainWindow(QMainWindow):
             
         except Exception as e:
             print(f"Build123d Extrusion error: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
             import traceback
             traceback.print_exc()
             return False
@@ -979,8 +1029,6 @@ class MainWindow(QMainWindow):
         """Echtes Fillet mit Build123d"""
         try:
             from build123d import fillet
-            import numpy as np
-            import pyvista as pv
             
             body = self._fillet_target_body
             if not hasattr(body, '_build123d_solid') or body._build123d_solid is None:
