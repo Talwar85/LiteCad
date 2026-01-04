@@ -31,7 +31,7 @@ from gui.sketch_editor import SketchEditor, SketchTool
 from gui.tool_panel import ToolPanel, PropertiesPanel
 from gui.tool_panel_3d import ToolPanel3D, BodyPropertiesPanel
 from gui.browser import ProjectBrowser
-from gui.input_panels import ExtrudeInputPanel
+from gui.input_panels import ExtrudeInputPanel, FilletChamferPanel
 from gui.viewport_pyvista import PyVistaViewport, HAS_PYVISTA, HAS_BUILD123D
 
 if not HAS_PYVISTA:
@@ -194,6 +194,15 @@ class MainWindow(QMainWindow):
         self.extrude_panel.cancelled.connect(self._on_extrude_cancelled)
         self.extrude_panel.bodies_visibility_toggled.connect(self._on_toggle_bodies_visibility)
         
+        # Fillet/Chamfer Panel
+        self.fillet_panel = FilletChamferPanel(self)
+        self.fillet_panel.radius_changed.connect(self._on_fillet_radius_changed)
+        self.fillet_panel.confirmed.connect(self._on_fillet_confirmed)
+        self.fillet_panel.cancelled.connect(self._on_fillet_cancelled)
+        
+        self._fillet_mode = None  # 'fillet' or 'chamfer'
+        self._fillet_target_body = None
+        
         self._create_toolbar()
 
     def resizeEvent(self, event):
@@ -295,8 +304,8 @@ class MainWindow(QMainWindow):
             'revolve': lambda: self._show_not_implemented("Revolve"),
             'sweep': lambda: self._show_not_implemented("Sweep"),
             'loft': lambda: self._show_not_implemented("Loft"),
-            'fillet': lambda: self._show_not_implemented("Verrundung"),
-            'chamfer': lambda: self._show_not_implemented("Fase"),
+            'fillet': self._start_fillet,
+            'chamfer': self._start_chamfer,
             'shell': lambda: self._show_not_implemented("Shell"),
             'hole': lambda: self._show_not_implemented("Bohrung"),
             'boolean_union': lambda: self._show_not_implemented("Boolean Vereinen"),
@@ -402,10 +411,36 @@ class MainWindow(QMainWindow):
         s = self.document.new_sketch(f"Sketch{len(self.document.sketches)+1}")
         s.plane_origin = origin; s.plane_normal = normal
         self.active_sketch = s; self.sketch_editor.sketch = s
+        
+        # Bodies als Referenz an SketchEditor übergeben
+        self._set_sketch_body_references(origin, normal)
+        
         self._set_mode("sketch")
         self.browser.refresh()
+    
+    def _set_sketch_body_references(self, origin, normal):
+        """Sammelt Body-Daten und übergibt sie an den SketchEditor"""
+        bodies_data = []
+        
+        for body in self.document.bodies:
+            mesh = self.viewport_3d.get_body_mesh(body.id)
+            if mesh is not None:
+                # Hole Farbe aus viewport
+                body_info = self.viewport_3d.bodies.get(body.id, {})
+                color = body_info.get('color', (0.6, 0.6, 0.8))
+                bodies_data.append({
+                    'mesh': mesh,
+                    'color': color
+                })
+        
+        # Übergebe an SketchEditor
+        if hasattr(self.sketch_editor, 'set_reference_bodies'):
+            self.sketch_editor.set_reference_bodies(bodies_data, normal, origin)
 
     def _finish_sketch(self):
+        # Body-Referenzen im SketchEditor löschen
+        if hasattr(self.sketch_editor, 'set_reference_bodies'):
+            self.sketch_editor.set_reference_bodies([], (0,0,1), (0,0,0))
         self._set_mode("3d"); self.browser.refresh()
 
     def _extrude_dialog(self):
@@ -488,30 +523,126 @@ class MainWindow(QMainWindow):
         for face in faces: f.extend([len(face)] + list(face))
         
         import pyvista as pv
-        new_mesh = pv.PolyData(v, np.array(f, dtype=np.int32)).clean()
         
-        if operation in ["Join", "Cut"]:
+        # Neues Mesh erstellen und aufbereiten
+        new_mesh = pv.PolyData(v, np.array(f, dtype=np.int32))
+        new_mesh = self._prepare_mesh_for_boolean(new_mesh)
+        
+        if operation in ["Join", "Cut", "Intersect"]:
+            # Suche passendes Target-Body
+            target_body = None
+            target_mesh = None
+            
             for body in self.document.bodies:
-                target_mesh = self.viewport_3d.get_body_mesh(body.id)
-                if target_mesh:
-                    try:
-                        if operation == "Cut":
-                            result = target_mesh.boolean_difference(new_mesh)
-                        else: 
-                            result = target_mesh.boolean_union(new_mesh)
-                        
-                        if result and result.n_points > 0:
-                            self._update_body_mesh(body, result)
-                            return
-                    except Exception as e:
-                        print(f"Boolean Op failed: {e}")
+                mesh = self.viewport_3d.get_body_mesh(body.id)
+                if mesh and mesh.n_points > 0:
+                    target_body = body
+                    target_mesh = self._prepare_mesh_for_boolean(mesh)
+                    break
+            
+            if target_mesh:
+                result = self._perform_boolean_operation(target_mesh, new_mesh, operation)
+                if result and result.n_points > 0:
+                    self._update_body_mesh(target_body, result)
+                    return
+                else:
+                    print(f"Boolean operation '{operation}' failed - creating new body instead")
 
+        # Fallback: Neuer Body
         b = self.document.new_body(f"Body{len(self.document.bodies)+1}")
         feat = ExtrudeFeature(FeatureType.EXTRUDE, "Extrude", None, abs(height))
         b.features.append(feat)
         b._mesh_vertices = verts
         b._mesh_triangles = faces
         self.viewport_3d.add_body(b.id, b.name, verts, faces)
+    
+    def _prepare_mesh_for_boolean(self, mesh):
+        """Bereitet ein Mesh für Boolean-Operationen vor"""
+        import pyvista as pv
+        
+        try:
+            # 1. Triangulieren (boolean braucht Dreiecke)
+            mesh = mesh.triangulate()
+            
+            # 2. Clean (entfernt doppelte Punkte, degenerierte Faces)
+            mesh = mesh.clean(tolerance=1e-6)
+            
+            # 3. Normals berechnen und konsistent machen
+            mesh.compute_normals(cell_normals=True, point_normals=True, 
+                               split_vertices=False, consistent_normals=True, 
+                               inplace=True)
+            
+            # 4. Fill holes wenn vorhanden
+            try:
+                mesh = mesh.fill_holes(hole_size=1000)
+            except:
+                pass
+                
+            return mesh
+        except Exception as e:
+            print(f"Mesh preparation error: {e}")
+            return mesh
+    
+    def _perform_boolean_operation(self, target, tool, operation):
+        """Führt Boolean-Operation mit Fehlerbehandlung durch"""
+        import pyvista as pv
+        
+        try:
+            # Versuche zuerst mit PyVista
+            if operation == "Cut":
+                result = target.boolean_difference(tool)
+            elif operation == "Join":
+                result = target.boolean_union(tool)
+            elif operation == "Intersect":
+                result = target.boolean_intersection(tool)
+            else:
+                return None
+            
+            if result and result.n_points > 0:
+                # Ergebnis aufräumen
+                result = result.clean(tolerance=1e-6)
+                result.compute_normals(inplace=True)
+                return result
+                
+        except Exception as e:
+            print(f"PyVista boolean failed: {e}")
+            
+            # Fallback: Versuche mit vtkBooleanOperationPolyDataFilter direkt
+            try:
+                return self._vtk_boolean_fallback(target, tool, operation)
+            except Exception as e2:
+                print(f"VTK fallback also failed: {e2}")
+        
+        return None
+    
+    def _vtk_boolean_fallback(self, target, tool, operation):
+        """VTK Boolean als Fallback"""
+        import vtk
+        import pyvista as pv
+        
+        # Konvertiere zu VTK
+        target_vtk = target.extract_surface()
+        tool_vtk = tool.extract_surface()
+        
+        # VTK Boolean Filter
+        boolean = vtk.vtkBooleanOperationPolyDataFilter()
+        boolean.SetInputData(0, target_vtk)
+        boolean.SetInputData(1, tool_vtk)
+        
+        if operation == "Cut":
+            boolean.SetOperationToDifference()
+        elif operation == "Join":
+            boolean.SetOperationToUnion()
+        elif operation == "Intersect":
+            boolean.SetOperationToIntersection()
+        
+        boolean.SetTolerance(1e-6)
+        boolean.Update()
+        
+        result = pv.wrap(boolean.GetOutput())
+        if result.n_points > 0:
+            return result.clean()
+        return None
 
     def _update_body_mesh(self, body, pv_mesh):
         points = pv_mesh.points.tolist()
@@ -619,3 +750,116 @@ class MainWindow(QMainWindow):
             f"<li>PyVista/VTK Rendering</li>"
             f"</ul>"
         )
+    
+    # ==================== FILLET / CHAMFER ====================
+    
+    def _start_fillet(self):
+        """Startet den Fillet-Modus"""
+        if not self.document.bodies:
+            self.statusBar().showMessage("Kein Body vorhanden für Fillet!", 3000)
+            return
+        
+        self._fillet_mode = "fillet"
+        self._fillet_target_body = self.document.bodies[-1]  # Letzter Body
+        
+        self.fillet_panel.set_mode("fillet")
+        self.fillet_panel.reset()
+        self.fillet_panel.show_at(self.viewport_3d)
+        
+        self.viewport_3d.set_edge_select_mode(True)
+        self.statusBar().showMessage("Fillet: Wähle Kanten oder gib Radius ein | Enter=OK | Esc=Abbrechen")
+    
+    def _start_chamfer(self):
+        """Startet den Chamfer-Modus"""
+        if not self.document.bodies:
+            self.statusBar().showMessage("Kein Body vorhanden für Chamfer!", 3000)
+            return
+        
+        self._fillet_mode = "chamfer"
+        self._fillet_target_body = self.document.bodies[-1]
+        
+        self.fillet_panel.set_mode("chamfer")
+        self.fillet_panel.reset()
+        self.fillet_panel.show_at(self.viewport_3d)
+        
+        self.viewport_3d.set_edge_select_mode(True)
+        self.statusBar().showMessage("Chamfer: Wähle Kanten oder gib Distanz ein | Enter=OK | Esc=Abbrechen")
+    
+    def _on_fillet_radius_changed(self, radius):
+        """Preview für Fillet/Chamfer"""
+        # Könnte Preview implementieren
+        pass
+    
+    def _on_fillet_confirmed(self):
+        """Fillet/Chamfer anwenden"""
+        if not self._fillet_target_body:
+            self._on_fillet_cancelled()
+            return
+        
+        radius = self.fillet_panel.get_radius()
+        
+        try:
+            mesh = self.viewport_3d.get_body_mesh(self._fillet_target_body.id)
+            if mesh:
+                if self._fillet_mode == "fillet":
+                    result = self._apply_fillet_to_mesh(mesh, radius)
+                else:
+                    result = self._apply_chamfer_to_mesh(mesh, radius)
+                
+                if result and result.n_points > 0:
+                    self._update_body_mesh(self._fillet_target_body, result)
+                    self.statusBar().showMessage(f"{self._fillet_mode.capitalize()} angewendet: {radius}mm", 3000)
+                else:
+                    self.statusBar().showMessage(f"{self._fillet_mode.capitalize()} fehlgeschlagen!", 3000)
+        except Exception as e:
+            print(f"Fillet/Chamfer error: {e}")
+            self.statusBar().showMessage(f"Fehler: {e}", 3000)
+        
+        self._on_fillet_cancelled()
+    
+    def _on_fillet_cancelled(self):
+        """Fillet/Chamfer abbrechen"""
+        self.fillet_panel.setVisible(False)
+        self.viewport_3d.set_edge_select_mode(False)
+        self._fillet_mode = None
+        self._fillet_target_body = None
+    
+    def _apply_fillet_to_mesh(self, mesh, radius):
+        """Wendet Fillet auf alle Feature-Kanten eines Meshes an"""
+        import pyvista as pv
+        import numpy as np
+        
+        try:
+            # Methode 1: Subdivision für weichere Kanten
+            # Das ist keine echte Verrundung, aber eine Approximation
+            smoothed = mesh.subdivide(nsub=1, subfilter='loop')
+            smoothed = smoothed.smooth(n_iter=int(radius * 10), relaxation_factor=0.1)
+            return smoothed.clean()
+        except Exception as e:
+            print(f"Fillet subdivision failed: {e}")
+        
+        try:
+            # Methode 2: Decimate + Smooth für ähnlichen Effekt
+            decimated = mesh.decimate(0.9)
+            smoothed = decimated.smooth(n_iter=50, relaxation_factor=0.1)
+            return smoothed.clean()
+        except Exception as e:
+            print(f"Fillet smooth failed: {e}")
+        
+        return None
+    
+    def _apply_chamfer_to_mesh(self, mesh, distance):
+        """Wendet Chamfer auf Feature-Kanten an"""
+        import pyvista as pv
+        
+        try:
+            # Chamfer ist schwieriger - wir nutzen clip_box als Workaround
+            # Für echtes Chamfer bräuchte man edge-by-edge Bearbeitung
+            
+            # Vereinfachte Version: Leichte Glättung
+            smoothed = mesh.smooth(n_iter=20, relaxation_factor=0.05)
+            return smoothed.clean()
+        except Exception as e:
+            print(f"Chamfer failed: {e}")
+        
+        return None

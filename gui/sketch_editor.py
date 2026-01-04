@@ -110,7 +110,7 @@ def ramer_douglas_peucker(points, epsilon):
         return [p1, p2]
 
 class DXFImportWorker(QThread):
-    finished_signal = Signal(list, list) # lines, circles
+    finished_signal = Signal(list, list, list)  # lines, circles, arcs
     error_signal = Signal(str)
     progress_signal = Signal(str)
 
@@ -128,6 +128,7 @@ class DXFImportWorker(QThread):
             
             new_lines = []
             new_circles = []
+            new_arcs = []  # (cx, cy, radius, start_angle, end_angle)
             
             # Helper: Konvertiert komplexe Formen in mikroskopisch feine Linien
             def add_path_as_lines(entity, matrix=None):
@@ -163,13 +164,12 @@ class DXFImportWorker(QThread):
                     for virtual_entity in entity.virtual_entities():
                         process_entity(virtual_entity, m)
                 
-                # Echte Kreise (sicher, da keine Winkel)
+                # Echte Kreise
                 elif dxftype == 'CIRCLE':
                     c = entity.dxf.center
                     if matrix: c = matrix.transform(c)
                     r = entity.dxf.radius
                     if matrix:
-                        # Skalierung approximieren
                         vec = matrix.transform_direction(ezdxf.math.Vec3(1, 0, 0))
                         r *= vec.magnitude
                     new_circles.append((c.x, c.y, r))
@@ -183,9 +183,33 @@ class DXFImportWorker(QThread):
                         end = matrix.transform(end)
                     new_lines.append((start.x, start.y, end.x, end.y))
 
-                # ALLES andere (Splines, Arcs, Polylines) -> High-Res Fitting
-                # Das verhindert Winkel-Fehler bei Arcs und Eckigkeit bei Splines
-                elif dxftype in ['ARC', 'SPLINE', 'LWPOLYLINE', 'POLYLINE', 'ELLIPSE']:
+                # Arcs als echte Arcs importieren
+                elif dxftype == 'ARC':
+                    c = entity.dxf.center
+                    r = entity.dxf.radius
+                    # DXF: Winkel in Grad, CCW von positiver X-Achse
+                    start_angle = entity.dxf.start_angle
+                    end_angle = entity.dxf.end_angle
+                    
+                    if matrix:
+                        c = matrix.transform(c)
+                        # Skalierung für Radius
+                        vec = matrix.transform_direction(ezdxf.math.Vec3(1, 0, 0))
+                        r *= vec.magnitude
+                        # Rotation für Winkel (vereinfacht - funktioniert für 90°-Rotationen)
+                        # Für komplexere Transformationen müsste man die Winkel neu berechnen
+                        rot_angle = math.degrees(math.atan2(vec.y, vec.x))
+                        start_angle += rot_angle
+                        end_angle += rot_angle
+                    
+                    # Normalisiere Winkel auf 0-360
+                    start_angle = start_angle % 360
+                    end_angle = end_angle % 360
+                    
+                    new_arcs.append((c.x, c.y, r, start_angle, end_angle))
+
+                # Splines, Polylines, Ellipsen -> High-Res Fitting
+                elif dxftype in ['SPLINE', 'LWPOLYLINE', 'POLYLINE', 'ELLIPSE']:
                     add_path_as_lines(entity, matrix)
 
             # Start
@@ -196,7 +220,7 @@ class DXFImportWorker(QThread):
                 if i % 20 == 0: 
                     self.progress_signal.emit(f"Importiere... {int(i/total*100)}%")
 
-            self.finished_signal.emit(new_lines, new_circles)
+            self.finished_signal.emit(new_lines, new_circles, new_arcs)
 
         except Exception as e:
             self.error_signal.emit(str(e))
@@ -327,6 +351,13 @@ class SketchEditor(QWidget, SketchHandlersMixin, SketchRendererMixin):
         self.tool_options = ToolOptionsPopup(self)
         self.tool_options.option_selected.connect(self._on_tool_option_selected)
         
+        # Body-Referenzen für transparente Anzeige im Hintergrund (Fusion360-Style)
+        self.reference_bodies = []  # Liste von {'edges_2d': [...], 'color': (r,g,b)}
+        self.show_body_reference = True  # Toggle für Anzeige
+        self.body_reference_opacity = 0.25  # Transparenz der Bodies
+        self.sketch_plane_normal = (0, 0, 1)  # Normale der Sketch-Ebene
+        self.sketch_plane_origin = (0, 0, 0)  # Ursprung der Sketch-Ebene
+        
         QTimer.singleShot(100, self._center_view)
     
     def world_to_screen(self, w):
@@ -340,6 +371,118 @@ class SketchEditor(QWidget, SketchHandlersMixin, SketchRendererMixin):
     def _center_view(self):
         self.view_offset = QPointF(self.width() / 2, self.height() / 2)
         self.update()
+    
+    def set_reference_bodies(self, bodies_data, plane_normal=(0,0,1), plane_origin=(0,0,0)):
+        """
+        Setzt die Body-Referenzen für transparente Anzeige.
+        bodies_data: Liste von {'mesh': pyvista_mesh, 'color': (r,g,b)} 
+        plane_normal/origin: Die Sketch-Ebene für 2D-Projektion
+        """
+        self.reference_bodies = []
+        self.sketch_plane_normal = plane_normal
+        self.sketch_plane_origin = plane_origin
+        
+        if not bodies_data:
+            self.update()
+            return
+        
+        import numpy as np
+        
+        # Berechne lokales Koordinatensystem für die Ebene
+        n = np.array(plane_normal)
+        n = n / np.linalg.norm(n) if np.linalg.norm(n) > 0 else np.array([0,0,1])
+        
+        # U und V Vektoren (lokal X und Y auf der Ebene)
+        if abs(n[2]) < 0.9:
+            u = np.cross(n, [0, 0, 1])
+        else:
+            u = np.cross(n, [1, 0, 0])
+        u = u / np.linalg.norm(u)
+        v = np.cross(n, u)
+        
+        origin = np.array(plane_origin)
+        
+        for body_info in bodies_data:
+            mesh = body_info.get('mesh')
+            color = body_info.get('color', (0.6, 0.6, 0.8))
+            
+            if mesh is None:
+                continue
+            
+            try:
+                # Extrahiere Kanten für Drahtgitter-Darstellung
+                edges = mesh.extract_feature_edges(
+                    boundary_edges=True,
+                    feature_edges=True,
+                    manifold_edges=False,
+                    feature_angle=30
+                )
+                
+                if edges.n_points == 0:
+                    edges = mesh.extract_all_edges()
+                
+                # Projiziere 3D-Kanten auf 2D-Ebene
+                edges_2d = []
+                
+                if edges.n_lines > 0:
+                    lines = edges.lines
+                    points = edges.points
+                    i = 0
+                    while i < len(lines):
+                        n_pts = lines[i]
+                        if n_pts >= 2:
+                            for j in range(n_pts - 1):
+                                p1_3d = points[lines[i + 1 + j]]
+                                p2_3d = points[lines[i + 2 + j]]
+                                
+                                # Projiziere auf Ebene (lokale 2D-Koordinaten)
+                                rel1 = p1_3d - origin
+                                rel2 = p2_3d - origin
+                                
+                                x1 = np.dot(rel1, u)
+                                y1 = np.dot(rel1, v)
+                                x2 = np.dot(rel2, u)
+                                y2 = np.dot(rel2, v)
+                                
+                                edges_2d.append((x1, y1, x2, y2))
+                        i += n_pts + 1
+                
+                if edges_2d:
+                    self.reference_bodies.append({
+                        'edges_2d': edges_2d,
+                        'color': color
+                    })
+                    
+            except Exception as e:
+                print(f"Body reference error: {e}")
+        
+        self.update()
+    
+    def _draw_body_references(self, painter):
+        """Zeichnet Bodies als transparente Referenz im Hintergrund"""
+        if not self.show_body_reference or not self.reference_bodies:
+            return
+        
+        painter.save()
+        
+        for body in self.reference_bodies:
+            edges_2d = body.get('edges_2d', [])
+            color = body.get('color', (0.6, 0.6, 0.8))
+            
+            # Farbe mit Transparenz
+            r, g, b = int(color[0]*255), int(color[1]*255), int(color[2]*255)
+            alpha = int(self.body_reference_opacity * 255)
+            
+            pen = QPen(QColor(r, g, b, alpha))
+            pen.setWidth(1)
+            painter.setPen(pen)
+            
+            for x1, y1, x2, y2 in edges_2d:
+                p1 = self.world_to_screen(QPointF(x1, y1))
+                p2 = self.world_to_screen(QPointF(x2, y2))
+                painter.drawLine(p1, p2)
+        
+        painter.restore()
     
     
     def _find_closed_profiles(self):
@@ -698,7 +841,7 @@ class SketchEditor(QWidget, SketchHandlersMixin, SketchRendererMixin):
         self._dxf_worker.progress_signal.connect(self.status_message.emit)
         self._dxf_worker.start()
 
-    def _on_dxf_finished(self, lines, circles):
+    def _on_dxf_finished(self, lines, circles, arcs):
         from PySide6.QtWidgets import QApplication
         
         self._save_undo()
@@ -710,11 +853,16 @@ class SketchEditor(QWidget, SketchHandlersMixin, SketchRendererMixin):
         # Kreise hinzufügen
         for c in circles:
             self.sketch.add_circle(c[0], c[1], c[2])
+        
+        # Arcs hinzufügen
+        for a in arcs:
+            # a = (cx, cy, radius, start_angle, end_angle)
+            self.sketch.add_arc(a[0], a[1], a[2], a[3], a[4])
             
         QApplication.restoreOverrideCursor()
         self._find_closed_profiles()
         self.sketched_changed.emit()
-        self.status_message.emit(f"Fertig: {len(lines)} Pfad-Segmente, {len(circles)} Kreise.")
+        self.status_message.emit(f"Fertig: {len(lines)} Linien, {len(circles)} Kreise, {len(arcs)} Bögen.")
         self.update()
         self._dxf_worker = None
 
@@ -1878,6 +2026,7 @@ class SketchEditor(QWidget, SketchHandlersMixin, SketchRendererMixin):
         p.setRenderHint(QPainter.Antialiasing)
         p.fillRect(self.rect(), self.BG_COLOR)
         self._draw_grid(p)
+        self._draw_body_references(p)  # Bodies als Referenz im Hintergrund
         self._draw_profiles(p)
         self._draw_axes(p)
         self._draw_geometry(p)

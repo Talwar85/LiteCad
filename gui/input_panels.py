@@ -421,3 +421,146 @@ class DimensionInputPanel(QFrame):
             pass
         else:
             super().keyPressEvent(event)
+
+
+class FilletChamferPanel(QFrame):
+    """Input panel for Fillet/Chamfer operations"""
+    
+    radius_changed = Signal(float)
+    confirmed = Signal()
+    cancelled = Signal()
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._radius = 2.0
+        self._mode = "fillet"  # "fillet" or "chamfer"
+        
+        self.setStyleSheet("""
+            QFrame {
+                background: #2d2d30;
+                border: 1px solid #0078d4;
+                border-radius: 6px;
+            }
+        """)
+        self.setFixedHeight(50)
+        self.setMinimumWidth(300)
+        
+        self._setup_ui()
+        self.setVisible(False)
+    
+    def _setup_ui(self):
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(8)
+        
+        # Label
+        self.label = QLabel("Fillet:")
+        self.label.setStyleSheet("color: #ccc; font-size: 12px; font-weight: bold; border: none;")
+        layout.addWidget(self.label)
+        
+        # Radius Input
+        self.radius_input = QDoubleSpinBox()
+        self.radius_input.setRange(0.1, 100)
+        self.radius_input.setDecimals(2)
+        self.radius_input.setSuffix(" mm")
+        self.radius_input.setValue(2.0)
+        self.radius_input.setFixedWidth(90)
+        self.radius_input.setStyleSheet("""
+            QDoubleSpinBox {
+                background: #1e1e1e;
+                border: 1px solid #3a3a3a;
+                border-radius: 3px;
+                color: #fff;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 4px 8px;
+            }
+            QDoubleSpinBox:focus { border-color: #0078d4; }
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+                background: #3a3a3a;
+                border: none;
+                width: 16px;
+            }
+        """)
+        self.radius_input.valueChanged.connect(self._on_value_changed)
+        layout.addWidget(self.radius_input)
+        
+        layout.addSpacing(8)
+        
+        # OK Button
+        self.ok_btn = QPushButton("✓ OK")
+        self.ok_btn.setFixedWidth(60)
+        self.ok_btn.setStyleSheet("""
+            QPushButton {
+                background: #0e639c;
+                border: none;
+                border-radius: 3px;
+                color: white;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 6px 12px;
+            }
+            QPushButton:hover { background: #1177bb; }
+        """)
+        self.ok_btn.clicked.connect(self._confirm)
+        layout.addWidget(self.ok_btn)
+        
+        # Cancel Button
+        self.cancel_btn = QPushButton("✕")
+        self.cancel_btn.setFixedSize(32, 32)
+        self.cancel_btn.setStyleSheet("""
+            QPushButton {
+                background: #3a3a3a;
+                border: 1px solid #4a4a4a;
+                border-radius: 3px;
+                color: #ccc;
+                font-size: 14px;
+            }
+            QPushButton:hover { background: #c42b1c; color: #fff; }
+        """)
+        self.cancel_btn.clicked.connect(self._cancel)
+        layout.addWidget(self.cancel_btn)
+    
+    def set_mode(self, mode: str):
+        """'fillet' or 'chamfer'"""
+        self._mode = mode
+        self.label.setText("Fillet:" if mode == "fillet" else "Chamfer:")
+    
+    def _on_value_changed(self, value):
+        self._radius = value
+        self.radius_changed.emit(value)
+    
+    def _confirm(self):
+        self.confirmed.emit()
+    
+    def _cancel(self):
+        self.cancelled.emit()
+    
+    def get_radius(self) -> float:
+        return self._radius
+    
+    def reset(self):
+        self._radius = 2.0
+        self.radius_input.blockSignals(True)
+        self.radius_input.setValue(2.0)
+        self.radius_input.blockSignals(False)
+    
+    def show_at(self, viewport_widget):
+        """Show panel at bottom center"""
+        self.setVisible(True)
+        self.adjustSize()
+        
+        parent = viewport_widget.parent() if viewport_widget.parent() else viewport_widget
+        x = (parent.width() - self.width()) // 2
+        y = parent.height() - 100
+        self.move(x, y)
+        self.radius_input.setFocus()
+        self.radius_input.selectAll()
+    
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self._confirm()
+        elif event.key() == Qt.Key_Escape:
+            self._cancel()
+        else:
+            super().keyPressEvent(event)

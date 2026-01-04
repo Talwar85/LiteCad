@@ -227,18 +227,18 @@ class PyVistaViewport(QWidget):
                 self._highlight_plane_at_position(x, y)
                 return False
             if self.is_dragging and self.extrude_mode:
-                # Berechne Extrusionsrichtung basierend auf Face-Normale und Kamera
+                # Extrude-Drag mit linker Maustaste
                 delta = self._calculate_extrude_delta(pos)
                 new_height = self.drag_start_height + delta
                 
-                # Nur updaten wenn sich die Höhe signifikant geändert hat
                 if abs(new_height - self.extrude_height) > 0.5:
                     self.show_extrude_preview(new_height)
                     self.height_changed.emit(self.extrude_height)
-                return True
+                return True  # Event konsumieren
             if self.extrude_mode and not self.is_dragging:
-                # Nur alle 50ms neu zeichnen um Flackern zu reduzieren
+                # Hover-Highlight für Faces
                 self._pick_face_at_position(x, y, hover_only=True)
+                return False  # Kamera-Rotation erlauben!
                 
         elif event.type() == QEvent.MouseButtonPress:
             if event.button() == Qt.LeftButton:
@@ -251,16 +251,23 @@ class PyVistaViewport(QWidget):
                 if self.plane_select_mode: 
                     self._pick_plane_at_position(x, y)
                 elif self.extrude_mode:
-                    if self._pick_face_at_position(x, y):
-                        self.is_dragging = True
-                        self.drag_start_pos = pos
-                        self.drag_start_height = self.extrude_height
-                        # Speichere die Normale des ausgewählten Faces für Drag-Richtung
-                        self._cache_drag_direction()
+                    # Prüfe ob wir auf eine Face klicken
+                    clicked_face = self._pick_face_at_position(x, y)
+                    if clicked_face:
+                        # Nur Drag starten wenn bereits Faces ausgewählt sind
+                        if self.selected_faces:
+                            self.is_dragging = True
+                            self.drag_start_pos = pos
+                            self.drag_start_height = self.extrude_height
+                            self._cache_drag_direction()
+                            return True  # Event konsumieren
+                    # Wenn keine Face getroffen, Kamera-Interaktion erlauben
+                    return False
                         
         elif event.type() == QEvent.MouseButtonRelease:
-            if self.is_dragging and self.extrude_mode:
+            if event.button() == Qt.LeftButton and self.is_dragging and self.extrude_mode:
                 self.is_dragging = False
+                return True
                 
         return False
     
@@ -601,6 +608,46 @@ class PyVistaViewport(QWidget):
             try:
                 self.plotter.remove_actor('body_face_selection')
             except: pass
+    
+    def set_edge_select_mode(self, enabled):
+        """Aktiviert/deaktiviert den Edge-Selection-Modus für Fillet/Chamfer"""
+        self.edge_select_mode = getattr(self, 'edge_select_mode', False)
+        self.edge_select_mode = enabled
+        self.selected_edges = getattr(self, 'selected_edges', set())
+        
+        if enabled:
+            # Highlight alle Kanten
+            self._highlight_all_edges()
+        else:
+            # Entferne Edge-Highlights
+            self._clear_edge_highlights()
+    
+    def _highlight_all_edges(self):
+        """Zeigt alle Kanten der Bodies als selektierbar an"""
+        try:
+            for bid, body_data in self.bodies.items():
+                mesh = body_data.get('mesh')
+                if mesh:
+                    edges = mesh.extract_feature_edges(feature_angle=30)
+                    name = f"edges_highlight_{bid}"
+                    self.plotter.add_mesh(edges, color='yellow', line_width=2, 
+                                         name=name, opacity=0.7)
+            self.plotter.update()
+        except Exception as e:
+            print(f"Edge highlight error: {e}")
+    
+    def _clear_edge_highlights(self):
+        """Entfernt alle Edge-Highlights"""
+        try:
+            for bid in self.bodies.keys():
+                name = f"edges_highlight_{bid}"
+                try:
+                    self.plotter.remove_actor(name)
+                except:
+                    pass
+            self.plotter.update()
+        except:
+            pass
     
     def _restore_body_colors(self):
         """Stellt Original-Farben aller Bodies wieder her"""
