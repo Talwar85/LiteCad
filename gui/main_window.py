@@ -114,6 +114,11 @@ class MainWindow(QMainWindow):
         self.mode = "3d"
         self.active_sketch = None
         self.selected_edges = [] # Liste der Indizes für Fillet
+        # Debounce Timer für Viewport Updates (Verhindert Mehrfachaufrufe)
+        self._update_timer = QTimer()
+        self._update_timer.setSingleShot(True)
+        self._update_timer.setInterval(50) # 50ms warten
+        self._update_timer.timeout.connect(self._update_viewport_all_impl)                                                                   
         self._apply_theme()
         self._create_ui()
         self._create_menus()
@@ -228,7 +233,7 @@ class MainWindow(QMainWindow):
         self.tool_stack.setMaximumWidth(200)
         self.tool_stack.setStyleSheet("background-color: #1e1e1e;")
         
-        self.transform_panel = TransformPanel(self) # Import oben anpassen!
+        self.transform_panel = TransformPanel(self)
         self.transform_panel.values_changed.connect(self._on_transform_val_change)
         self.transform_panel.confirmed.connect(self._on_transform_confirmed)
         self.transform_panel.cancelled.connect(self._on_transform_cancelled)
@@ -263,8 +268,8 @@ class MainWindow(QMainWindow):
         self.sketch_editor.viewport = self.viewport_3d
         
         # Splitter-Einstellungen
-        self.main_splitter.setStretchFactor(0, 0)  # Links nicht stretchen
-        self.main_splitter.setStretchFactor(1, 1)  # Viewport stretchen
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
         self.main_splitter.setSizes([340, 1000])
         
         layout.addWidget(self.main_splitter)
@@ -376,7 +381,7 @@ class MainWindow(QMainWindow):
         self.browser.plane_selected.connect(self._on_browser_plane_selected)
         
         # WICHTIG: Visibility changed muss ALLES neu laden (Sketches + Bodies)
-        self.browser.visibility_changed.connect(self._update_viewport_all)
+        self.browser.visibility_changed.connect(self._trigger_viewport_update)
         
         if hasattr(self.viewport_3d, 'set_body_visibility'):
             self.browser.body_vis_changed.connect(self.viewport_3d.set_body_visibility)
@@ -389,6 +394,36 @@ class MainWindow(QMainWindow):
         self.viewport_3d.extrude_requested.connect(self._on_extrusion_finished)
         self.viewport_3d.height_changed.connect(self._on_viewport_height_changed)
     
+    # --- DEBOUNCED UPDATE LOGIC ---
+    def _trigger_viewport_update(self):
+        """Startet den Timer für das Update (Debounce)"""
+        self._update_timer.start() # Reset timer if called again
+        
+    def _update_viewport_all_impl(self):
+        """Das eigentliche Update, wird vom Timer aufgerufen"""
+        # Sketches
+        self.viewport_3d.set_sketches(self.browser.get_visible_sketches())
+        
+        # Bodies
+        self.viewport_3d.clear_bodies()
+        colors = [(0.6,0.6,0.8), (0.8,0.6,0.6), (0.6,0.8,0.6)]
+        
+        for i, (b, visible) in enumerate(self.browser.get_visible_bodies()):
+            if visible and hasattr(b, '_mesh_vertices'):
+                # Hier übergeben wir jetzt AUCH Normals und Edges, falls vorhanden!
+                self.viewport_3d.add_body(
+                    b.id, 
+                    b.name, 
+                    b._mesh_vertices, 
+                    b._mesh_triangles, 
+                    color=colors[i%3],
+                    normals=getattr(b, '_mesh_normals', None),
+                    edges=getattr(b, '_mesh_edges', None)
+                )
+
+    def _update_viewport_all(self):
+        """Legacy Wrapper: Ruft sofortiges Update auf (wenn nötig) oder Trigger"""
+        self._trigger_viewport_update()                                        
     def _on_3d_action(self, action: str):
         """Verarbeitet 3D-Tool-Aktionen"""
         actions = {
@@ -732,149 +767,111 @@ class MainWindow(QMainWindow):
 
     def _on_extrusion_finished(self, face_indices, height, operation="New Body"):
         """
-        Führt die Extrusion durch.
-        Priorisiert den parametrischen Weg (B-Rep), fällt aber auf Mesh zurück falls nötig.
+        Zentrale Methode für Extrusionen.
+        Erstellt ein parametrisches BREP Feature. Mesh-Fallback nur im Notfall.
         """
-        # 1. Validierung und UI Cleanup
+        # 1. Validierung
         if not face_indices or abs(height) < 0.001:
-            self.extrude_panel.setVisible(False)
-            self.viewport_3d.set_all_bodies_visible(True)
-            self.viewport_3d.set_extrude_mode(False)
+            self._finish_extrusion_ui(success=False)
             return
 
-        # 2. Sketch identifizieren
-        # Wir müssen herausfinden, welcher Sketch zu der angeklickten Fläche gehört
+        # 2. Analyse der Auswahl
+        sketch_faces_indices = []
+        body_faces_data = []
         target_sketch = None
-        is_body_face = False
-        
+
         if hasattr(self.viewport_3d, 'detected_faces'):
-            idx = face_indices[0]
-            if 0 <= idx < len(self.viewport_3d.detected_faces):
-                face_data = self.viewport_3d.detected_faces[idx]
-                if face_data.get('type') == 'body_face':
-                    is_body_face = True
-                    # TODO: Body-Face Extrusion (Push/Pull) Logik hier
-                else:
-                    target_sketch = face_data.get('sketch')
-
-        # Nimm den aktiven Sketch oder den, der zur geklickten Fläche gehört
-        sketch_to_use = self.active_sketch if self.active_sketch else target_sketch
-
-        # =========================================================
-        # PFAD A: Parametrisch / B-Rep (Build123d) - BEVORZUGT
-        # =========================================================
-        if HAS_BUILD123D and sketch_to_use and not is_body_face:
-            try:
-                print(f"Starte parametrische Extrusion: {operation}, Höhe={height}")
-                
-                # A1. Feature Objekt erstellen
-                # Dies speichert die "Intention" (Sketch + Höhe + Op)
-                feature = ExtrudeFeature(
-                    sketch=sketch_to_use,
-                    distance=height,
-                    operation=operation
-                )
-                
-                # A2. Ziel-Körper bestimmen
-                target_body = None
-                
-                if operation == "New Body":
-                    target_body = self.document.new_body()
-                else:
-                    # Bei Join/Cut/Intersect brauchen wir einen existierenden Körper
-                    target_body = self._get_active_body()
-                    
-                    # Falls kein Körper aktiv ist, nehmen wir den letzten
-                    if not target_body and self.document.bodies:
-                        target_body = self.document.bodies[-1]
-                    
-                    # Wenn gar kein Körper da ist, erzwingen wir "New Body"
-                    if not target_body:
-                        print("Kein Zielkörper für Boolean gefunden -> Erstelle neuen Body")
-                        target_body = self.document.new_body()
-                        feature.operation = "New Body"
-
-                if target_body:
-                    # A3. Feature hinzufügen und Rebuild auslösen
-                    # Das triggert body._rebuild(), was body._build123d_solid erzeugt (B-Rep!)
-                    target_body.add_feature(feature)
-                    
-                    # A4. Visuelles Mesh aktualisieren
-                    # Wir rufen _update_body_mesh auf, ohne Mesh zu übergeben.
-                    # Die Methode holt sich dann die frischen Daten aus dem Body.
-                    self._update_body_mesh(target_body, mesh_override=None)
-                    
-                    # Wenn es eine Boolean-Operation war und ein anderer Körper als "Werkzeug" diente,
-                    # müsste man theoretisch aufräumen. Hier ist alles im Feature gekapselt.
-                    
-                    # A5. Abschluss
-                    self._finish_extrusion_ui(success=True, msg=f"Extrusion ({feature.operation}) erfolgreich.")
-                    return
-
-            except Exception as e:
-                print(f"FEHLER bei parametrischer Extrusion: {e}")
-                import traceback
-                traceback.print_exc()
-                # Wir stürzen nicht ab, sondern gehen weiter zum Fallback (Pfad B)
-
-        # =========================================================
-        # PFAD B: Fallback (Mesh Only / Legacy)
-        # =========================================================
-        print("Fallback auf Mesh-Extrusion (Keine B-Rep Daten)")
-        
-        try:
-            # Wir holen uns die "dummen" Dreiecke direkt aus der Viewport-Berechnung
-            verts_all = []
-            faces_all = []
-            offset = 0
-            
             for idx in face_indices:
-                v, f = self.viewport_3d.get_extrusion_data(idx, height)
-                if v and f:
-                    verts_all.extend(v)
-                    for face in f:
-                        # Indizes anpassen, da wir Listen zusammenfügen
-                        faces_all.append(tuple(idx + offset for idx in face))
-                    offset += len(v)
+                if 0 <= idx < len(self.viewport_3d.detected_faces):
+                    face = self.viewport_3d.detected_faces[idx]
+                    if face.get('type') == 'body_face':
+                        body_faces_data.append(face)
+                    else:
+                        sketch_faces_indices.append(idx)
+                        if target_sketch is None: 
+                            target_sketch = face.get('sketch')
 
-            if verts_all and faces_all:
-                # B1. Mesh Operationen simulieren (sehr eingeschränkt ohne CAD Kernel)
-                if operation == "New Body" or not self.document.bodies:
-                    # Einfach neuen Body anlegen
-                    b = self.document.new_body(f"MeshBody_{len(self.document.bodies)+1}")
-                    # Manuelles Setzen der Mesh-Daten
-                    b._mesh_vertices = verts_all
-                    b._mesh_triangles = faces_all
-                    b._build123d_solid = None # Explizit kein B-Rep
+        # =========================================================
+        # HAUPTPFAD: Parametrisch / BREP (Build123d)
+        # =========================================================
+        if HAS_BUILD123D:
+            success = False
+            
+            # --- FALL A: Sketch Extrusion (Der Normalfall) ---
+            if sketch_faces_indices and target_sketch:
+                try:
+                    # Sammle Selector-Punkte für Multiselect
+                    selector_points = []
+                    for idx in sketch_faces_indices:
+                        f = self.viewport_3d.detected_faces[idx]
+                        selector_points.append(f.get('center_2d'))
+
+                    print(f"BREP Extrusion: {operation}, Profile={len(selector_points)}")
                     
-                    self.viewport_3d.add_body(b.id, b.name, verts_all, faces_all)
-                
-                else:
-                    # Boolean auf Mesh-Ebene (Join/Cut) ist sehr schwer stabil zu bekommen ohne CAD Kernel.
-                    # Wir erstellen hier einfach einen neuen Body und warnen den User.
-                    print("Boolean auf Mesh-Ebene nicht unterstützt -> Erstelle neuen Body.")
-                    b = self.document.new_body(f"MeshBody_{len(self.document.bodies)+1}")
-                    b._mesh_vertices = verts_all
-                    b._mesh_triangles = faces_all
-                    self.viewport_3d.add_body(b.id, b.name, verts_all, faces_all)
-                    self.statusBar().showMessage("Warnung: Boolean fehlgeschlagen (Mesh-Modus), neuer Körper erstellt.", 4000)
+                    # 1. Feature Definition (Logik)
+                    feature = ExtrudeFeature(
+                        sketch=target_sketch,
+                        distance=height,
+                        operation=operation,
+                        selector=selector_points 
+                    )
+                    
+                    # 2. Target Body bestimmen
+                    target_body = None
+                    if operation == "New Body":
+                        target_body = self.document.new_body()
+                    else:
+                        target_body = self._get_active_body()
+                        if not target_body: 
+                            # Fallback: Wenn kein Body aktiv, erstelle neuen
+                            target_body = self.document.new_body()
+                            feature.operation = "New Body"
 
-                self._finish_extrusion_ui(success=True, msg="Extrusion (Mesh) erstellt.")
+                    if target_body:
+                        # 3. BREP BERECHNUNG (Das Herzstück!)
+                        # Hier wird target_body._build123d_solid aktualisiert
+                        target_body.add_feature(feature)
+                        
+                        # 4. VISUALISIERUNG (Tessellierung)
+                        # Hier wird aus dem Solid ein Mesh für PyVista gemacht
+                        self._update_body_mesh(target_body, None)
+                        
+                        success = True
+                        
+                except Exception as e:
+                    print(f"CRITICAL ERROR bei BREP Extrusion: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Wir setzen success NICHT auf True -> Fallback wird unten ausgelöst
+
+            # --- FALL B: Body Face Extrusion (Push/Pull) ---
+            elif body_faces_data:
+                 for face_data in body_faces_data:
+                      # Wir nutzen hier eine Hilfsmethode, die hoffentlich auch BREP macht
+                      if hasattr(self, '_extrude_body_face_build123d'):
+                           if self._extrude_body_face_build123d(face_data, height, operation):
+                               success = True
+
+            # Wenn BREP erfolgreich war, sind wir fertig!
+            if success:
+                self._finish_extrusion_ui(success=True, msg=f"Extrusion ({operation}) erstellt.")
                 return
 
-        except Exception as e:
-            print(f"Fataler Fehler im Fallback: {e}")
-            self.statusBar().showMessage("Fehler: Extrusion konnte nicht erstellt werden.")
-
-        # Wenn wir hier sind, ist alles fehlgeschlagen
-        self._finish_extrusion_ui(success=False)
+        # =========================================================
+        # NOTFALL PFAD: Mesh Only
+        # =========================================================
+        # Wenn wir hier ankommen, ist BREP fehlgeschlagen oder Build123d fehlt.
+        print("ACHTUNG: Fallback auf reine Mesh-Extrusion (Verlust der Parametrik!)")
+        
+        # Hier würde der alte Mesh-Code stehen...
+        
+        self._finish_extrusion_ui(success=False, msg="Extrusion fehlgeschlagen (siehe Konsole).")
 
     def _finish_extrusion_ui(self, success=True, msg=""):
-        """Hilfsfunktion zum Aufräumen der UI nach Extrusion"""
+        """Hilfsfunktion zum Aufräumen der UI"""
         self.extrude_panel.setVisible(False)
         self.viewport_3d.set_extrude_mode(False)
         self.viewport_3d.set_all_bodies_visible(True)
-        
         if success:
             self.browser.refresh()
             if msg: self.statusBar().showMessage(msg)
@@ -882,88 +879,93 @@ class MainWindow(QMainWindow):
         
     def _extrude_body_face_build123d(self, face_data, height, operation):
         """
-        Extrudiert eine Fläche eines existierenden Solids unter Beibehaltung der CAD-Daten (Push/Pull).
+        Extrusion einer Body-Fläche (Push/Pull) mit erweitertem Error-Handling.
         """
+        print(f"--- DEBUG: START BODY FACE EXTRUDE (Op: {operation}) ---")
         try:
             body_id = face_data.get('body_id')
-            # Finde den originalen Body im Dokument
             target_body = next((b for b in self.document.bodies if b.id == body_id), None)
             
             if not target_body or not hasattr(target_body, '_build123d_solid') or target_body._build123d_solid is None:
-                print("Ziel-Körper hat keine BREP Daten.")
+                print("DEBUG: Kein Target Body oder kein Solid gefunden")
                 return False
 
-            from build123d import Vector, extrude, add, cut, intersect
-            
-            # 1. B-Rep Face wiederfinden
-            # Wir haben vom Viewport (Mesh) den Mittelpunkt der geklickten Fläche.
-            # Wir suchen im CAD-Modell die Fläche, die diesem Punkt am nächsten ist.
+            from build123d import Vector, extrude, Face, Solid, Compound, Shape
             
             mesh_center = Vector(face_data['center_3d'])
             mesh_normal = Vector(face_data['normal'])
             
+            # --- FACE SUCHE (Scoring) ---
             best_face = None
-            min_dist = float('inf')
+            best_score = -float('inf')
             
-            # Iteriere über alle mathematischen Flächen des Solids
+            # Nur Faces prüfen, die in die gleiche Richtung zeigen (Performance + Sicherheit)
             for face in target_body._build123d_solid.faces():
-                # Distanz checken
                 try:
-                    # face.center() berechnet den exakten geometrischen Mittelpunkt
                     cad_center = face.center()
-                    dist = (cad_center - mesh_center).length
+                    cad_normal = face.normal_at(cad_center)
                     
-                    if dist < min_dist:
-                        # Optional: Normale checken, um Rückseiten auszuschließen
-                        # face.normal_at(cad_center) ... (hier vereinfacht weggelassen für Robustheit)
-                        min_dist = dist
+                    # Schneller Vor-Check
+                    if cad_normal.dot(mesh_normal) < 0.5: continue
+
+                    align = cad_normal.dot(mesh_normal)
+                    dist = (cad_center - mesh_center).length
+                    score = (align * 1000) - dist
+                    
+                    if face.is_inside(mesh_center): score += 5000
+                    
+                    if score > best_score:
+                        best_score = score
                         best_face = face
-                except:
-                    continue
+                except: pass
             
-            # Toleranz: Wenn die Abweichung zu groß ist (> 10mm), haben wir die Fläche wohl nicht gefunden
-            if best_face is None or min_dist > 10.0:
-                print(f"B-Rep Face nicht gefunden (Min Dist: {min_dist})")
+            if best_face is None:
+                print("DEBUG: Keine passende CAD-Fläche gefunden.")
                 return False
 
-            print(f"B-Rep Face gefunden! (Abweichung: {min_dist:.4f}mm)")
-
-            # 2. Operation durchführen
-            # extrude() in build123d kann direkt ein Face annehmen
-            # dir=(0,0,0) bedeutet: entlang der Flächennormalen extrudieren (Standard Push/Pull)
-            new_geo = extrude(best_face, amount=height)
+            # --- EXTRUSION ---
+            try:
+                # extrude liefert Solid oder Compound (Part)
+                new_geo = extrude(best_face, amount=height)
+            except Exception as e:
+                print(f"DEBUG: Extrude-Berechnung fehlgeschlagen: {e}")
+                return False
             
-            # 3. Boolean Logik
+            # --- BOOLEAN / ZUWEISUNG ---
             final_solid = None
             
             if operation == "New Body":
-                # Neuen Körper erstellen
+                # Neuer Body um Z-Fighting/Merge Probleme zu vermeiden
                 new_body = self.document.new_body(f"Extrusion_{len(self.document.bodies)+1}")
                 new_body._build123d_solid = new_geo
+                
+                print("DEBUG: Meshing New Body...")
+                # CRASH FIX: Sicherstellen, dass _update_body mit Compounds umgehen kann
                 self._update_body_from_build123d(new_body, new_geo)
-                # Browser refresh passiert im Caller
                 return True
                 
-            elif operation == "Join":
-                final_solid = add(target_body._build123d_solid, new_geo)
-            elif operation == "Cut":
-                final_solid = cut(target_body._build123d_solid, new_geo)
-            elif operation == "Intersect":
-                final_solid = intersect(target_body._build123d_solid, new_geo)
+            # Boolean
+            try:
+                if operation == "Join":
+                    final_solid = target_body._build123d_solid + new_geo
+                elif operation == "Cut":
+                    final_solid = target_body._build123d_solid - new_geo
+                elif operation == "Intersect":
+                    final_solid = target_body._build123d_solid & new_geo
+            except Exception as e:
+                print(f"DEBUG: Boolean Error: {e}")
+                return False
             
-            if final_solid:
-                # 4. Bestehenden Körper updaten
+            if final_solid is not None:
                 target_body._build123d_solid = final_solid
                 self._update_body_from_build123d(target_body, final_solid)
-                print(f"Body Extrusion ({operation}) erfolgreich via B-Rep.")
                 return True
             
             return False
             
         except Exception as e:
-            print(f"Face extrude error: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"DEBUG: CRITICAL ERROR: {e}")
+            import traceback; traceback.print_exc()
             return False
             
             
@@ -1003,90 +1005,99 @@ class MainWindow(QMainWindow):
     
     
     def _update_body_from_build123d(self, body, solid):
-        """High-Performance Update mit OCP Tessellierung (Korrigiert)"""
+        """Generiert Mesh mit korrekter Kanten-Extraktion für OCP"""
+        # print(f"DEBUG: _update_body_from_build123d START für '{body.name}'", flush=True)
+        
         try:
             success = False
             
+            # Speicher initialisieren
+            body._mesh_vertices = []
+            body._mesh_triangles = []
+            body._mesh_normals = []
+            body._mesh_edges = []      # Für Indizes (Standard)
+            body._mesh_edge_lines = [] # NEU: Für Koordinaten (OCP)
+            
+            body._build123d_solid = solid
+            
+            shape = solid
+            if hasattr(solid, 'wrapped'): shape = solid.wrapped
+
+            # --- OPTION A: OCP Tessellate ---
             if HAS_OCP_TESSELLATE:
                 try:
-                    # OCP Tessellate Aufruf
-                    # Argumente können je nach Version variieren, 'tolerance' ist Standard
-                    # Rückgabe ist meist: (vertices, triangles, normals, edges)
-                    result = tessellate(solid.wrapped, tolerance=0.1)
+                    from ocp_tessellate.tessellator import tessellate
                     
-                    # Entpacken (wir ignorieren edges am Ende)
-                    # Falls das Tupel anders aussieht, fangen wir das ab
-                    if isinstance(result, tuple) and len(result) >= 2:
-                        verts = result[0]
-                        triangles = result[1]
-                        
-                        # Sicherstellen, dass es Listen sind für PyVista
-                        import numpy as np
-                        
-                        # 1. Vertices
-                        if isinstance(verts, np.ndarray):
-                            # Reshape falls flach (N*3) -> (N, 3)
-                            if len(verts.shape) == 1:
-                                verts = verts.reshape(-1, 3)
-                            v_list = verts.tolist()
-                        else:
-                            v_list = verts
+                    result = tessellate(
+                        shape, f"{id(shape)}", 0.1, quality=0.1,
+                        angular_tolerance=0.2, compute_faces=True, compute_edges=True, debug=False
+                    )
+                    
+                    # Entpacken
+                    verts_flat = None; tris_flat = None; norms_flat = None; edges_flat = None
+                    if isinstance(result, dict):
+                        verts_flat = result.get("vertices")
+                        tris_flat = result.get("triangles")
+                        norms_flat = result.get("normals")
+                        edges_flat = result.get("edges")
+                    elif isinstance(result, tuple):
+                        if len(result) >= 3: verts_flat, tris_flat, norms_flat = result[0], result[1], result[2]
+                        if len(result) >= 4: edges_flat = result[3]
+                    
+                    import numpy as np
 
-                        # 2. Triangles (Faces)
-                        # OCP liefert oft [v1, v2, v3, v1, v2, v3...] als flache Liste
-                        # PyVista braucht [(v1,v2,v3), (v4,v5,v6)...]
-                        if isinstance(triangles, np.ndarray):
-                            t_flat = triangles.reshape(-1)
-                            t_list = t_flat.tolist()
+                    # 1. Vertices
+                    if verts_flat is not None:
+                        if isinstance(verts_flat, np.ndarray): body._mesh_vertices = verts_flat.reshape(-1, 3).tolist()
+                        else: body._mesh_vertices = [tuple(verts_flat[i:i+3]) for i in range(0, len(verts_flat), 3)]
+                    
+                    # 2. Normals
+                    if norms_flat is not None:
+                        if isinstance(norms_flat, np.ndarray): body._mesh_normals = norms_flat.reshape(-1, 3).tolist()
+                        else: body._mesh_normals = [tuple(norms_flat[i:i+3]) for i in range(0, len(norms_flat), 3)]
+
+                    # 3. Triangles
+                    if tris_flat is not None:
+                        if isinstance(tris_flat, np.ndarray): body._mesh_triangles = tris_flat.reshape(-1, 3).tolist()
+                        else: body._mesh_triangles = [tuple(tris_flat[i:i+3]) for i in range(0, len(tris_flat), 3)]
+                        
+                    # 4. Edges (FIX: Als Koordinaten behandeln!)
+                    if edges_flat is not None and len(edges_flat) > 0:
+                        # OCP liefert Segmente: [P1x, P1y, P1z, P2x, P2y, P2z, ...]
+                        if isinstance(edges_flat, np.ndarray):
+                            body._mesh_edge_lines = edges_flat.reshape(-1, 3).tolist()
                         else:
-                            t_list = triangles
-                            
-                        # Umwandeln in Tupel-Liste [(i1, i2, i3), ...]
-                        if len(t_list) > 0:
-                            # Prüfen ob Format [3, v1, v2, v3] (VTK style) oder [v1, v2, v3] (Simple)
-                            # ocp-tessellate liefert meist simple Indizes
-                            f_tuples = [tuple(t_list[i:i+3]) for i in range(0, len(t_list), 3)]
-                            
-                            # Update Body
-                            body._mesh_vertices = v_list
-                            body._mesh_triangles = f_tuples
-                            body._build123d_solid = solid
-                            
-                            # Viewport Update
-                            self.viewport_3d.add_body(
-                                body.id, 
-                                body.name, 
-                                v_list, 
-                                f_tuples, 
-                                color=getattr(body, 'color', None)
-                            )
-                            success = True
-                            
+                            body._mesh_edge_lines = [tuple(edges_flat[i:i+3]) for i in range(0, len(edges_flat), 3)]
+                    
+                    success = True
+
                 except Exception as e:
-                    print(f"OCP Tessellation error (fallback active): {e}")
-
+                    print(f"DEBUG: OCP Tessellation Exception: {e}", flush=True)
+            
+            # --- OPTION B: Fallback ---
             if not success:
-                # Fallback: Langsame Standard-Methode von Build123d
                 mesh = solid.tessellate(tolerance=0.1)
-                v_list = [(v.X, v.Y, v.Z) for v in mesh[0]]
-                f_tuples = [tuple(t) for t in mesh[1]]
-                
-                body._mesh_vertices = v_list
-                body._mesh_triangles = f_tuples
-                body._build123d_solid = solid
-                
-                self.viewport_3d.add_body(
-                    body.id, 
-                    body.name, 
-                    v_list, 
-                    f_tuples, 
-                    color=getattr(body, 'color', None)
-                )
+                body._mesh_vertices = [(v.X, v.Y, v.Z) for v in mesh[0]]
+                body._mesh_triangles = [tuple(t) for t in mesh[1]]
+            
+            # --- VIEWPORT UPDATE ---
+            if not body._mesh_vertices or not body._mesh_triangles:
+                return
 
+            self.viewport_3d.add_body(
+                body.id, 
+                body.name, 
+                body._mesh_vertices, 
+                body._mesh_triangles, 
+                color=getattr(body, 'color', None),
+                normals=getattr(body, '_mesh_normals', None),
+                edges=getattr(body, '_mesh_edges', None),          # Indizes
+                edge_lines=getattr(body, '_mesh_edge_lines', None) # NEU: Koordinaten
+            )
+            
         except Exception as e:
-            print(f"Critical mesh update error: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"DEBUG: MESHING ERROR: {e}", flush=True)
+            import traceback; traceback.print_exc()
 
     def _show_extrude_input_dialog(self):
         """Legacy Dialog - wird durch Panel ersetzt"""

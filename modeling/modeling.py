@@ -72,7 +72,9 @@ class ExtrudeFeature(Feature):
     sketch: Sketch = None
     distance: float = 10.0
     direction: int = 1 
-    operation: str = "New Body"  # "New Body", "Join", "Cut", "Intersect"
+    operation: str = "New Body"
+    # ÄNDERUNG: Wir erlauben eine Liste von Punkten (oder None für "alles")
+    selector: list = None 
     
     def __post_init__(self):
         self.type = FeatureType.EXTRUDE
@@ -128,7 +130,10 @@ class Body:
         # Visualisierungs-Daten (Mesh)
         self._mesh_vertices: List[Tuple[float, float, float]] = []
         self._mesh_triangles: List[Tuple[int, int, int]] = []
-    
+        self._mesh_normals = [] 
+        self._mesh_edges = []
+        
+        
     def add_feature(self, feature: Feature):
         """Feature hinzufügen und Geometrie neu berechnen"""
         self.features.append(feature)
@@ -183,34 +188,79 @@ class Body:
             self._update_mesh_from_solid(current_solid)
 
     def _compute_extrude_part(self, feature: ExtrudeFeature):
-        """Berechnet die Geometrie für eine Extrusion"""
+        """Berechnet die Geometrie für eine Extrusion mit robuster Profil-Filterung"""
         if not HAS_BUILD123D or not feature.sketch: return None
         
         try:
             sketch = feature.sketch
             plane = self._get_plane_from_sketch(sketch)
             
+            # Wichtig: Point importieren
+            from shapely.geometry import Point, Polygon as ShapelyPoly
+            
             with BuildPart() as part:
                 with BuildSketch(plane):
-                    # Profile aus Sketch holen
                     profiles = sketch.find_closed_profiles()
-                    
                     created_any = False
-                    # 1. Geschlossene Polygone/Linienzüge
+                    
                     for p in profiles:
-                        # Build123d Polygon erwartet float Punkte
+                        # Punkte extrahieren
                         points = [(float(l.start.x), float(l.start.y)) for l in p]
                         
                         if len(points) >= 3:
-                            # FIX: *points (unpacking) und align=None (kein auto-center)
-                            Polygon(*points, align=None)
-                            created_any = True
+                            should_create = False
+                            
+                            # LOGIK: 
+                            # None -> Alles
+                            # Liste/Tupel -> Filtern
+                            if feature.selector is None:
+                                should_create = True
+                            else:
+                                try:
+                                    poly = ShapelyPoly(points)
+                                    # Normalisiere selector zu einer Liste von Punkten
+                                    selectors = feature.selector
+                                    if isinstance(selectors, tuple) and len(selectors) == 2 and isinstance(selectors[0], (int, float)):
+                                        # Es war nur ein einzelner Punkt (tuple)
+                                        selectors = [selectors]
+                                    
+                                    # Prüfe ob EINER der Selector-Punkte passt
+                                    for sel_pt in selectors:
+                                        # Buffer(0) repariert oft invalid Geometrie, contains ist strikt
+                                        # Wir nutzen distance < epsilon für Robustheit an Kanten
+                                        pt = Point(sel_pt)
+                                        if poly.contains(pt) or poly.distance(pt) < 1e-4:
+                                            should_create = True
+                                            break
+                                except Exception as e:
+                                    # Fallback bei Fehler: Erstellen
+                                    print(f"Selector check warning: {e}")
+                                    should_create = True
+                            
+                            if should_create:
+                                Polygon(*points, align=None)
+                                created_any = True
                     
-                    # 2. Kreise
+                    # Kreise
                     for c in sketch.circles:
-                        with Location((float(c.center.x), float(c.center.y))):
-                            B123Circle(radius=float(c.radius))
-                        created_any = True
+                        should_create = False
+                        if feature.selector is None:
+                            should_create = True
+                        else:
+                            selectors = feature.selector
+                            if isinstance(selectors, tuple) and len(selectors) == 2 and isinstance(selectors[0], (int, float)):
+                                selectors = [selectors]
+                                
+                            for sel_pt in selectors:
+                                dist = math.sqrt((c.center.x - sel_pt[0])**2 + (c.center.y - sel_pt[1])**2)
+                                if dist <= c.radius:
+                                    should_create = True
+                                    break
+                        
+                        if should_create:
+                            with Location((float(c.center.x), float(c.center.y))):
+                                B123Circle(radius=float(c.radius))
+                            created_any = True
                 
                 if created_any:
                     extrude(amount=feature.distance * feature.direction)
@@ -235,65 +285,79 @@ class Body:
 
     def _update_mesh_from_solid(self, solid):
         """Generiert Mesh-Daten für die GUI (High Performance)"""
+        import numpy as np
+        
         # Reset
         self._mesh_vertices = []
         self._mesh_triangles = []
+        self._mesh_normals = []
+        self._mesh_edges = []
 
         # --- OPTION A: High Performance OCP Tessellation ---
         try:
-            # Wir importieren die Low-Level Funktion, die den Cache (make_key Bug) umgeht
-            from ocp_tessellate.tessellator import compute_tessellation
+            from ocp_tessellate.tessellator import tessellate
             
-            # compute_tessellation(shape, quality, angular_tolerance, ...)
-            # quality: Abweichung in mm (niedriger = feiner) -> entspricht tolerance
-            # angular_tolerance: Winkelabweichung in Radiant (z.B. 0.2 ~= 12 Grad)
+            # Einstellungen für Qualität
+            shape = solid.wrapped
+            # Cache Key generieren (optional, aber gut für Performance bei ocp_tessellate intern)
+            cache_key = f"{id(shape)}" 
+            deviation = 0.1
             
-            # Wir nutzen 0.1mm Toleranz und 0.2rad Winkel.
-            # parallel=True aktiviert Multi-Threading (massiver Speedup!)
-            result = compute_tessellation(
-                solid.wrapped, 
-                quality=0.1, 
-                angular_tolerance=0.2, 
-                parallel=True
+            result = tessellate(
+                shape,
+                cache_key,      # key
+                deviation,            # deviation (linear tolerance)
+                quality=0.1,    # quality (same as deviation usually)
+                angular_tolerance=0.2,
+                compute_faces=True,
+                compute_edges=True,  # WICHTIG: Kanten berechnen lassen!
+                debug=False
             )
+
+            # --- 1. VERTICES & NORMALS ---
+            # ocp_tessellate gibt oft flache Arrays zurück [x,y,z,x,y,z...]
             
-            # Ergebnis entpacken: (vertices, triangles, normals, edges)
-            verts_flat = result[0]
-            tris_flat = result[1]
+            verts_flat = result["vertices"]
+            norms_flat = result["normals"]
             
-            # Numpy Handling (falls installiert, was bei ocp_tessellate der Fall ist)
-            import numpy as np
-            
-            # Vertices formatieren: Flaches Array -> Liste von (x,y,z)
+            # Vertices konvertieren
             if isinstance(verts_flat, np.ndarray):
-                # Reshape zu Nx3 Matrix und dann zu Liste
                 self._mesh_vertices = verts_flat.reshape(-1, 3).tolist()
             else:
-                # Fallback für Listen
-                self._mesh_vertices = [
-                    tuple(verts_flat[i:i+3]) 
-                    for i in range(0, len(verts_flat), 3)
-                ]
+                self._mesh_vertices = [tuple(verts_flat[i:i+3]) for i in range(0, len(verts_flat), 3)]
 
-            # Triangles formatieren: Flaches Array -> Liste von (i1, i2, i3)
-            if isinstance(tris_flat, np.ndarray):
-                # Uint32 Array zu Int Liste konvertieren
-                # Reshape Nx3 Matrix -> Liste von Tupeln
-                tris_reshaped = tris_flat.reshape(-1, 3)
-                self._mesh_triangles = [tuple(t) for t in tris_reshaped.tolist()]
+            # Normals konvertieren (identisch zu Vertices)
+            if isinstance(norms_flat, np.ndarray):
+                 self._mesh_normals = norms_flat.reshape(-1, 3).tolist()
             else:
-                self._mesh_triangles = [
-                    tuple(tris_flat[i:i+3]) 
-                    for i in range(0, len(tris_flat), 3)
-                ]
-                
+                 self._mesh_normals = [tuple(norms_flat[i:i+3]) for i in range(0, len(norms_flat), 3)]
+
+            # --- 2. TRIANGLES ---
+            tris_flat = result["triangles"]
+            if isinstance(tris_flat, np.ndarray):
+                # reshape zu [(i1,i2,i3), ...]
+                self._mesh_triangles = tris_flat.reshape(-1, 3).tolist()
+            else:
+                self._mesh_triangles = [tuple(tris_flat[i:i+3]) for i in range(0, len(tris_flat), 3)]
+
+            # --- 3. EDGES ---
+            # Edges kommen als Liste von Indizes-Paaren [start, end, start, end...]
+            # Wir wollen sie als Liste von Tupeln [(i1, i2), (i3, i4), ...]
+            edges_flat = result["edges"]
+            if edges_flat is not None and len(edges_flat) > 0:
+                if isinstance(edges_flat, np.ndarray):
+                    self._mesh_edges = edges_flat.reshape(-1, 2).tolist()
+                else:
+                    self._mesh_edges = [tuple(edges_flat[i:i+2]) for i in range(0, len(edges_flat), 2)]
+            
             return # Erfolg!
             
         except ImportError:
-            pass # ocp_tessellate nicht installiert
+            pass 
         except Exception as e:
-            # Nur printen wenn es wirklich ocp_tessellate Fehler war, aber weitermachen
-            print(f"Performance Tessellation skip: {e}")
+            print(f"Tessellation warning: {e}")
+            import traceback
+            traceback.print_exc()
 
         # --- OPTION B: Standard Build123d Fallback (Robust) ---
         try:
