@@ -1,6 +1,6 @@
 """
 LiteCAD - 3D Modeling
-Robust B-Rep Implementation with Build123d
+Robust B-Rep Implementation with Build123d & Smart Failure Recovery
 """
 
 from dataclasses import dataclass, field
@@ -10,6 +10,8 @@ import math
 import uuid
 import sys
 import os
+import traceback
+from loguru import logger # WICHTIG: Loguru nutzen
 
 # ==================== IMPORTS ====================
 HAS_BUILD123D = False
@@ -24,12 +26,13 @@ try:
         Part, Sketch as B123Sketch, 
         Rectangle as B123Rect, Circle as B123Circle,
         Polyline, Polygon, make_face, Mode,
-        export_stl, export_step
+        export_stl, export_step,
+        GeomType
     )
     HAS_BUILD123D = True
-    print("✓ build123d geladen (Modeling).")
+    logger.success("✓ build123d geladen (Modeling).")
 except ImportError as e:
-    print(f"! build123d nicht gefunden: {e}")
+    logger.error(f"! build123d nicht gefunden: {e}")
 
 # Fallback OCP Imports
 if not HAS_BUILD123D:
@@ -66,6 +69,7 @@ class Feature:
     id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
     visible: bool = True
     suppressed: bool = False
+    status: str = "OK" # OK, ERROR, WARNING
 
 @dataclass
 class ExtrudeFeature(Feature):
@@ -73,7 +77,6 @@ class ExtrudeFeature(Feature):
     distance: float = 10.0
     direction: int = 1 
     operation: str = "New Body"
-    # ÄNDERUNG: Wir erlauben eine Liste von Punkten (oder None für "alles")
     selector: list = None 
     
     def __post_init__(self):
@@ -94,7 +97,9 @@ class RevolveFeature(Feature):
 @dataclass 
 class FilletFeature(Feature):
     radius: float = 2.0
-    edges: List = field(default_factory=list)
+    # Wir speichern hier Indizes oder Point-Selectors, um Kanten wiederzufinden
+    # Für den Anfang: Liste von Kanten-Selektoren (z.B. Center Points) oder None für "Alle"
+    edge_selectors: List = None 
     
     def __post_init__(self):
         self.type = FeatureType.FILLET
@@ -103,7 +108,7 @@ class FilletFeature(Feature):
 @dataclass
 class ChamferFeature(Feature):
     distance: float = 2.0
-    edges: List = field(default_factory=list)
+    edge_selectors: List = None
     
     def __post_init__(self):
         self.type = FeatureType.CHAMFER
@@ -114,8 +119,7 @@ class ChamferFeature(Feature):
 
 class Body:
     """
-    3D-Körper (Body)
-    Speichert Build123d Solid (BREP) und Mesh für Anzeige.
+    3D-Körper (Body) mit RobustPartBuilder Logik.
     """
     
     def __init__(self, name: str = "Body"):
@@ -133,7 +137,6 @@ class Body:
         self._mesh_normals = [] 
         self._mesh_edges = []
         
-        
     def add_feature(self, feature: Feature):
         """Feature hinzufügen und Geometrie neu berechnen"""
         self.features.append(feature)
@@ -144,48 +147,190 @@ class Body:
             self.features.remove(feature)
             self._rebuild()
     
+    def _safe_operation(self, op_name, op_func, fallback_func=None):
+        """
+        Wrapper für kritische CAD-Operationen.
+        Fängt Crashes ab und erlaubt Fallbacks.
+        """
+        try:
+            result = op_func()
+            
+            # Validierung des Ergebnisses
+            if result is None:
+                raise ValueError("Operation returned None")
+            
+            # Bei Build123d Objekten checken ob valid
+            if hasattr(result, 'is_valid') and not result.is_valid():
+                raise ValueError("Result geometry is invalid")
+                
+            return result, "OK"
+            
+        except Exception as e:
+            logger.warning(f"Feature '{op_name}' fehlgeschlagen: {e}")
+            # traceback.print_exc() # Optional für Debugging
+            
+            if fallback_func:
+                logger.info(f"→ Versuche Fallback für '{op_name}'...")
+                try:
+                    res_fallback = fallback_func()
+                    if res_fallback:
+                        logger.success(f"✓ Fallback für '{op_name}' erfolgreich.")
+                        return res_fallback, "WARNING" # Status Warning, weil nicht original
+                except Exception as e2:
+                    logger.error(f"✗ Auch Fallback fehlgeschlagen: {e2}")
+            
+            return None, "ERROR"
+
     def _rebuild(self):
         """
-        Der Kern der Parametrik:
-        Durchläuft alle Features und baut den Solid Schritt für Schritt neu auf.
+        Robuster Rebuild-Prozess (History-basiert).
         """
-        # Reset
-        self._build123d_solid = None
-        self.shape = None
+        logger.info(f"Rebuilding Body '{self.name}' ({len(self.features)} Features)...")
+        
+        # Reset visual data
         self._mesh_vertices.clear()
         self._mesh_triangles.clear()
         
+        # Startzustand: Leer oder Base Object
         current_solid = None
         
-        for feature in self.features:
-            if feature.suppressed: continue
+        for i, feature in enumerate(self.features):
+            if feature.suppressed:
+                feature.status = "SUPPRESSED"
+                continue
             
-            # --- EXTRUDE ---
+            new_solid = None
+            status = "OK"
+            
+            # ================= EXTRUDE =================
             if isinstance(feature, ExtrudeFeature):
-                new_part = self._compute_extrude_part(feature)
+                def op_extrude():
+                    return self._compute_extrude_part(feature)
                 
-                if new_part:
+                # Extrude hat noch keinen Fallback (könnte man z.B. ohne Selector probieren)
+                part_geometry, status = self._safe_operation(f"Extrude_{i}", op_extrude)
+                
+                if part_geometry:
                     if current_solid is None or feature.operation == "New Body":
-                        current_solid = new_part
-                    elif feature.operation == "Join":
-                        current_solid = current_solid + new_part
-                    elif feature.operation == "Cut":
-                        current_solid = current_solid - new_part
-                    elif feature.operation == "Intersect":
-                        current_solid = current_solid & new_part
+                        new_solid = part_geometry
+                    else:
+                        # Boolean Operationen
+                        try:
+                            if feature.operation == "Join":
+                                new_solid = current_solid + part_geometry
+                            elif feature.operation == "Cut":
+                                new_solid = current_solid - part_geometry
+                            elif feature.operation == "Intersect":
+                                new_solid = current_solid & part_geometry
+                        except Exception as e:
+                            logger.error(f"Boolean {feature.operation} failed: {e}")
+                            status = "ERROR"
+
+            # ================= FILLET =================
+            elif isinstance(feature, FilletFeature):
+                if current_solid:
+                    # Closure für Retry-Logik
+                    def op_fillet(rad=feature.radius):
+                        # Kanten finden (Logic TBD: Wir nehmen für jetzt ALLE oder Selektierte)
+                        edges_to_fillet = self._resolve_edges(current_solid, feature.edge_selectors)
+                        if not edges_to_fillet: raise ValueError("No edges selected")
+                        return fillet(edges_to_fillet, radius=rad)
+                    
+                    def fallback_fillet():
+                        # Smart Retry: Versuche 99% (oft Fix für Tangential-Probleme) oder 50%
+                        try:
+                            return op_fillet(feature.radius * 0.99)
+                        except:
+                            return op_fillet(feature.radius * 0.5)
+
+                    new_solid, status = self._safe_operation(f"Fillet_{i}", op_fillet, fallback_fillet)
+                    
+                    # Wenn Fillet fehlschlägt, behalten wir den alten Solid!
+                    if new_solid is None:
+                        new_solid = current_solid 
+                        # Feature markieren wir trotzdem als Error
+                        status = "ERROR" 
+
+            # ================= CHAMFER =================
+            elif isinstance(feature, ChamferFeature):
+                if current_solid:
+                    def op_chamfer(dist=feature.distance):
+                        edges = self._resolve_edges(current_solid, feature.edge_selectors)
+                        if not edges: raise ValueError("No edges")
+                        return chamfer(edges, length=dist)
+                    
+                    def fallback_chamfer():
+                        return op_chamfer(feature.distance * 0.5)
+
+                    new_solid, status = self._safe_operation(f"Chamfer_{i}", op_chamfer, fallback_chamfer)
+                    if new_solid is None: new_solid = current_solid; status = "ERROR"
             
-            # --- REVOLVE (Platzhalter) ---
-            elif isinstance(feature, RevolveFeature):
-                pass 
+            # --- STATUS UPDATE ---
+            feature.status = status
+            
+            # Wenn Feature erfolgreich (oder Fallback), Update current_solid
+            # Wenn Fehler bei Boolean/Extrude, bleibt current_solid beim Alten (History Preservation)
+            if new_solid is not None:
+                current_solid = new_solid
                 
-        # Ergebnis speichern
+        # Ende der History Chain
         if current_solid:
             self._build123d_solid = current_solid
             if hasattr(current_solid, 'wrapped'):
                 self.shape = current_solid.wrapped 
             
-            # Mesh erzeugen
+            # Mesh erzeugen (nur einmal am Ende)
             self._update_mesh_from_solid(current_solid)
+            # B-Rep Statistik abrufen
+            n_faces = len(current_solid.faces())
+            n_edges = len(current_solid.edges())
+            logger.success(f"✓ {self.name}: BREP Valid ({n_faces} Faces, {n_edges} Edges)")
+        else:
+            logger.warning(f"Body '{self.name}' is empty after rebuild.")
+
+    def _resolve_edges(self, solid, selectors):
+        """
+        Versucht, Kanten basierend auf Selektoren im aktuellen Solid zu finden.
+        Parametric Robustness: Dies ist der schwierigste Teil (Topological Naming).
+        
+        Einfache Strategie für jetzt:
+        - Wenn selectors None: Alle Kanten (Vorsicht!)
+        - Sonst: Selektoren sind Punkte (Centers) im Raum. Wir suchen die nächste Kante.
+        """
+        if not selectors:
+            return solid.edges() # Fallback: Alles
+        
+        found_edges = []
+        all_edges = solid.edges()
+        
+        for sel in selectors:
+            # Annahme: sel ist ein Tupel/Vector (x,y,z)
+            # Finde Kante mit geringstem Abstand zum Punkt
+            best_edge = None
+            min_dist = float('inf')
+            
+            try:
+                # Wir konvertieren den Selector in einen Vector
+                p_sel = Vector(sel)
+                
+                for edge in all_edges:
+                    # Edge Center berechnen
+                    try:
+                        # Build123d Edge hat .center()
+                        dist = (edge.center() - p_sel).length
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_edge = edge
+                    except: pass
+                
+                # Toleranz: Wenn Kante sich drastisch verschoben hat (> 20mm), nicht nehmen
+                if best_edge and min_dist < 20.0:
+                    found_edges.append(best_edge)
+                    
+            except Exception:
+                pass
+                
+        return found_edges
 
     def _compute_extrude_part(self, feature: ExtrudeFeature):
         """Berechnet die Geometrie für eine Extrusion mit robuster Profil-Filterung"""
@@ -221,20 +366,17 @@ class Body:
                                     # Normalisiere selector zu einer Liste von Punkten
                                     selectors = feature.selector
                                     if isinstance(selectors, tuple) and len(selectors) == 2 and isinstance(selectors[0], (int, float)):
-                                        # Es war nur ein einzelner Punkt (tuple)
                                         selectors = [selectors]
                                     
                                     # Prüfe ob EINER der Selector-Punkte passt
                                     for sel_pt in selectors:
-                                        # Buffer(0) repariert oft invalid Geometrie, contains ist strikt
-                                        # Wir nutzen distance < epsilon für Robustheit an Kanten
+                                        # Buffer(0) repariert oft invalid Geometrie
                                         pt = Point(sel_pt)
                                         if poly.contains(pt) or poly.distance(pt) < 1e-4:
                                             should_create = True
                                             break
                                 except Exception as e:
-                                    # Fallback bei Fehler: Erstellen
-                                    print(f"Selector check warning: {e}")
+                                    logger.warning(f"Selector check warning: {e}")
                                     should_create = True
                             
                             if should_create:
@@ -268,10 +410,8 @@ class Body:
             return part.part 
             
         except Exception as e:
-            print(f"Extrude calc failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
+            logger.error(f"Extrude calc failed: {e}")
+            raise e # Weiterwerfen für _safe_operation
 
     def _get_plane_from_sketch(self, sketch):
         """Erstellt Build123d Plane aus Sketch-Daten"""
@@ -299,89 +439,68 @@ class Body:
             
             # Einstellungen für Qualität
             shape = solid.wrapped
-            # Cache Key generieren (optional, aber gut für Performance bei ocp_tessellate intern)
             cache_key = f"{id(shape)}" 
             deviation = 0.1
             
             result = tessellate(
-                shape,
-                cache_key,      # key
-                deviation,            # deviation (linear tolerance)
-                quality=0.1,    # quality (same as deviation usually)
-                angular_tolerance=0.2,
-                compute_faces=True,
-                compute_edges=True,  # WICHTIG: Kanten berechnen lassen!
-                debug=False
+                shape, cache_key, deviation, quality=0.1,
+                angular_tolerance=0.2, compute_faces=True, 
+                compute_edges=True, debug=False
             )
 
-            # --- 1. VERTICES & NORMALS ---
-            # ocp_tessellate gibt oft flache Arrays zurück [x,y,z,x,y,z...]
-            
+            # 1. Vertices & Normals
             verts_flat = result["vertices"]
             norms_flat = result["normals"]
             
-            # Vertices konvertieren
             if isinstance(verts_flat, np.ndarray):
                 self._mesh_vertices = verts_flat.reshape(-1, 3).tolist()
             else:
                 self._mesh_vertices = [tuple(verts_flat[i:i+3]) for i in range(0, len(verts_flat), 3)]
 
-            # Normals konvertieren (identisch zu Vertices)
             if isinstance(norms_flat, np.ndarray):
                  self._mesh_normals = norms_flat.reshape(-1, 3).tolist()
             else:
                  self._mesh_normals = [tuple(norms_flat[i:i+3]) for i in range(0, len(norms_flat), 3)]
 
-            # --- 2. TRIANGLES ---
+            # 2. Triangles
             tris_flat = result["triangles"]
             if isinstance(tris_flat, np.ndarray):
-                # reshape zu [(i1,i2,i3), ...]
                 self._mesh_triangles = tris_flat.reshape(-1, 3).tolist()
             else:
                 self._mesh_triangles = [tuple(tris_flat[i:i+3]) for i in range(0, len(tris_flat), 3)]
 
-            # --- 3. EDGES ---
-            # Edges kommen als Liste von Indizes-Paaren [start, end, start, end...]
-            # Wir wollen sie als Liste von Tupeln [(i1, i2), (i3, i4), ...]
+            # 3. Edges
             edges_flat = result["edges"]
             if edges_flat is not None and len(edges_flat) > 0:
+                # OCP liefert Koordinaten [x,y,z, x,y,z...], diese werden direkt gespeichert
+                # Main Window viewport muss wissen, dass das Koordinaten sind, keine Indizes!
                 if isinstance(edges_flat, np.ndarray):
-                    self._mesh_edges = edges_flat.reshape(-1, 2).tolist()
+                    # Wir speichern es als separate Variable für OCP Linien
+                    self._mesh_edge_lines = edges_flat.reshape(-1, 3).tolist()
                 else:
-                    self._mesh_edges = [tuple(edges_flat[i:i+2]) for i in range(0, len(edges_flat), 2)]
+                    self._mesh_edge_lines = [tuple(edges_flat[i:i+3]) for i in range(0, len(edges_flat), 3)]
             
-            return # Erfolg!
+            return 
             
         except ImportError:
             pass 
         except Exception as e:
-            print(f"Tessellation warning: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.warning(f"Tessellation warning: {e}")
 
-        # --- OPTION B: Standard Build123d Fallback (Robust) ---
+        # --- OPTION B: Standard Build123d Fallback ---
         try:
-            # Liefert (Liste[Vector], Liste[List[int]])
             mesh = solid.tessellate(tolerance=0.05)
-            
             self._mesh_vertices = [(v.X, v.Y, v.Z) for v in mesh[0]]
-            
             self._mesh_triangles = []
             for face_indices in mesh[1]:
                 if len(face_indices) == 3:
                     self._mesh_triangles.append(tuple(face_indices))
                 elif len(face_indices) == 4:
-                    # Quad -> 2 Tris
                     self._mesh_triangles.append((face_indices[0], face_indices[1], face_indices[2]))
                     self._mesh_triangles.append((face_indices[0], face_indices[2], face_indices[3]))
-                else:
-                    # N-Gon Fan
-                    v0 = face_indices[0]
-                    for i in range(1, len(face_indices) - 1):
-                        self._mesh_triangles.append((v0, face_indices[i], face_indices[i+1]))
                         
         except Exception as e:
-            print(f"CRITICAL MESHING ERROR: {e}")
+            logger.error(f"CRITICAL MESHING ERROR: {e}")
 
     def export_stl(self, filename: str) -> bool:
         """STL Export"""
@@ -390,18 +509,8 @@ class Body:
                 export_stl(self._build123d_solid, filename)
                 return True
             except Exception as e:
-                print(f"Build123d STL export failed: {e}")
+                logger.error(f"Build123d STL export failed: {e}")
         
-        if HAS_OCP and self.shape is not None:
-            try:
-                mesh = BRepMesh_IncrementalMesh(self.shape, 0.1)
-                mesh.Perform()
-                writer = StlAPI_Writer()
-                writer.Write(self.shape, filename)
-                return True
-            except Exception as e:
-                print(f"OCP STL export failed: {e}")
-                
         if self._mesh_vertices and self._mesh_triangles:
             return self._export_stl_simple(filename)
             

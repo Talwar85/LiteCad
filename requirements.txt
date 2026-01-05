@@ -5,4 +5,5 @@ pyvista>=0.42.0
 vtk>=9.2.0
 ezdxf>=1.0.0
 build123d>=0.5.0
-ocp-tessellate
+ocp-tessellate=3.10
+pymeshlab

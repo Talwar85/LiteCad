@@ -8,7 +8,6 @@ class ToolPanel3D(QWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        # Serioseres Styling: Dunkler, dezenter, keine bunten Rahmen
         self.setStyleSheet("""
             QWidget { background-color: #1e1e1e; color: #e0e0e0; font-family: Segoe UI, sans-serif; font-size: 11px; }
             QGroupBox { 
@@ -48,19 +47,19 @@ class ToolPanel3D(QWidget):
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(15)
         
-        # --- Clean Buttons (Ohne Emojis) ---
-        
+        # --- Sketch & Base ---
         self._add_group("Sketch & Base", [
             ("New Sketch", "new_sketch"),
             ("Extrude", "extrude"),
         ])
         
+        # --- Modify ---
         self._add_group("Modify", [
             ("Fillet", "fillet"),
             ("Chamfer", "chamfer"),
         ])
 
-        # Grid für die Tools (Move, Rotate etc.)
+        # --- Transform ---
         self._add_group("Transform", [
             ("Move", "Move", "move_body"),
             ("Rot", "Rotate", "rotate_body"),
@@ -69,14 +68,17 @@ class ToolPanel3D(QWidget):
             ("Copy", "Copy", "copy_body"),
         ], grid=True)
         
+        # --- Boolean ---
         self._add_group("Boolean", [
             ("Union", "boolean_union"),
             ("Cut", "boolean_cut"),
             ("Intersect", "boolean_intersect"),
         ])
         
+        # --- Export (Updated) ---
         self._add_group("Export", [
-            ("STL Export", "export_stl"),
+            ("STL Export (Mesh)", "export_stl"),
+            ("STEP Export (CAD)", "export_step"), # NEU
         ])
         
         self.layout.addStretch()
@@ -96,7 +98,6 @@ class ToolPanel3D(QWidget):
             
         for i, btn_data in enumerate(buttons):
             if grid:
-                # Format: (Kurztext, Tooltip, Action)
                 label, tip, action = btn_data
                 btn = self._create_btn(label, action)
                 btn.setToolTip(tip)
@@ -104,7 +105,6 @@ class ToolPanel3D(QWidget):
                 btn.setStyleSheet("text-align: center; font-weight: bold;")
                 lay.addWidget(btn, i // 2, i % 2)
             else:
-                # Format: (Label, Action)
                 label, action = btn_data
                 btn = self._create_btn(label, action)
                 lay.addWidget(btn)
@@ -115,12 +115,11 @@ class ToolPanel3D(QWidget):
         btn = QToolButton()
         btn.setText(text)
         btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        btn.setToolButtonStyle(Qt.ToolButtonTextOnly) # Nur Text
+        btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         btn.setCursor(Qt.PointingHandCursor)
         btn.clicked.connect(lambda checked=False, a=action_name: self.action_triggered.emit(a))
         return btn
 
-# Platzhalter-Klasse für BodyPropertiesPanel
 class BodyPropertiesPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -135,6 +134,11 @@ class BodyPropertiesPanel(QWidget):
         if hasattr(body, 'name'):
             info = f"<b>{body.name}</b><br>"
             if hasattr(body, 'id'): info += f"ID: {body.id}<br>"
+            
+            # Info über Datenstatus
+            has_brep = hasattr(body, '_build123d_solid') and body._build123d_solid is not None
+            info += f"<br>Typ: {'Parametrisch (BREP)' if has_brep else 'Mesh (Tesselliert)'}"
+            
             if hasattr(body, 'features') and body.features:
                 info += f"<br>Features: {len(body.features)}"
             self.lbl_info.setText(info)

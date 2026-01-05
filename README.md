@@ -1,4 +1,4 @@
-# LiteCAD
+# MashCAD
 
 A lightweight CAD application focused on 2D sketching for 3D printing workflows.
 
