@@ -21,6 +21,8 @@ except ImportError:
     
 # WICHTIG: Unser neuer Helper
 from modeling.cad_tessellator import CADTessellator
+from modeling.mesh_converter import MeshToBREPConverter # NEU
+
 
 # ==================== IMPORTS ====================
 HAS_BUILD123D = False
@@ -157,7 +159,39 @@ class Body:
         if feature in self.features:
             self.features.remove(feature)
             self._rebuild()
-    
+            
+    def convert_to_brep(self):
+        """
+        Versucht, die aktuellen Mesh-Daten in ein echtes CAD-BREP umzuwandeln.
+        Dies ermöglicht Boolesche Operationen und präzise Schnitte.
+        """
+        if self._build123d_solid is not None:
+            logger.info(f"Body '{self.name}' ist bereits BREP.")
+            return True
+
+        if self.vtk_mesh is None:
+            logger.warning("Keine Mesh-Daten vorhanden.")
+            return False
+
+        converter = MeshToBREPConverter()
+        
+        # Wir zielen auf 2000-5000 Faces, damit OCP nicht abstürzt
+        solid = converter.convert(self.vtk_mesh, target_faces=3000, smooth=True)
+
+        if solid:
+            self._build123d_solid = solid
+            self.shape = solid.wrapped
+            
+            # Wichtig: Ein Feature hinzufügen, damit der Browser Bescheid weiß
+            # Wir nutzen ein Dummy-Feature, damit Rebuilds funktionieren (oder wir löschen die Mesh-History)
+            logger.success(f"Body '{self.name}' erfolgreich zu BREP konvertiert.")
+            
+            # Mesh neu berechnen (diesmal vom BREP abgeleitet für Konsistenz)
+            self._update_mesh_from_solid(solid)
+            return True
+        else:
+            return False
+            
     def _safe_operation(self, op_name, op_func, fallback_func=None):
         """
         Wrapper für kritische CAD-Operationen.

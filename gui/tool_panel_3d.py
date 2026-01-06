@@ -75,10 +75,18 @@ class ToolPanel3D(QWidget):
             ("Intersect", "boolean_intersect"),
         ])
         
-        # --- Export (Updated) ---
-        self._add_group("Export", [
-            ("STL Export (Mesh)", "export_stl"),
-            ("STEP Export (CAD)", "export_step"), # NEU
+        # --- Tools ---
+        # FIX: Now works with 3 elements (Label, Tooltip, Action)
+        self._add_group("Tools", [
+            ("Convert Mesh to CAD", "Konvertiert Mesh zu Solid (BREP)", "convert_to_brep"), 
+            ("Measure", "Messen", "measure"),
+        ])
+        
+        # --- Import/Export (Updated) ---
+        self._add_group("File", [
+            ("Import Mesh", "Lade STL/OBJ Datei", "import_mesh"),  # <--- NEU
+            ("STL Export", "export_stl"),
+            ("STEP Export", "export_step"),
         ])
         
         self.layout.addStretch()
@@ -97,16 +105,22 @@ class ToolPanel3D(QWidget):
             lay.setContentsMargins(5, 10, 5, 5)
             
         for i, btn_data in enumerate(buttons):
-            if grid:
+            # FIX: Flexible unpacking for 2 or 3 elements
+            if len(btn_data) == 3:
                 label, tip, action = btn_data
-                btn = self._create_btn(label, action)
+            else:
+                label, action = btn_data
+                tip = None
+
+            btn = self._create_btn(label, action)
+            if tip: 
                 btn.setToolTip(tip)
+
+            if grid:
                 btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
                 btn.setStyleSheet("text-align: center; font-weight: bold;")
                 lay.addWidget(btn, i // 2, i % 2)
             else:
-                label, action = btn_data
-                btn = self._create_btn(label, action)
                 lay.addWidget(btn)
                 
         self.layout.addWidget(group)

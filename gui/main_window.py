@@ -505,7 +505,7 @@ class MainWindow(QMainWindow):
         self._fillet_target_body = None
         
         self._create_toolbar()
-
+     
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._position_extrude_panel()
@@ -598,7 +598,62 @@ class MainWindow(QMainWindow):
         self._update_timer.start() # Reset timer if called again
         
     # In Klasse MainWindow:
+    
+    # In gui/main_window.py
 
+    def _import_mesh_dialog(self):
+        """Importiert STL/OBJ Dateien als neuen Body"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, 
+            "Mesh importieren", 
+            "", 
+            "Mesh Files (*.stl *.obj *.ply);;All Files (*.*)"
+        )
+        
+        if not path:
+            return
+
+        try:
+            import pyvista as pv
+            import os
+            
+            # 1. Datei laden
+            mesh = pv.read(path)
+            
+            # FIX: n_cells statt n_faces nutzen (PyVista Update)
+            if not mesh or mesh.n_cells == 0:
+                self.statusBar().showMessage("Fehler: Leeres Mesh oder ungültiges Format.")
+                return
+
+            # 2. Neuen Body im Dokument anlegen
+            filename = os.path.basename(path)
+            new_body = self.document.new_body(name=filename)
+            
+            # 3. WICHTIG: Das Mesh direkt zuweisen (als VTK Objekt)
+            new_body.vtk_mesh = mesh
+            
+            # 4. Viewport aktualisieren
+            self.viewport_3d.add_body(
+                bid=new_body.id,
+                name=new_body.name,
+                mesh_obj=mesh,
+                color=(0.7, 0.7, 0.7) 
+            )
+            
+            # 5. Browser aktualisieren
+            self.browser.refresh()
+            
+            # FIX: n_cells statt n_faces für die Anzeige
+            self.statusBar().showMessage(f"Importiert: {filename} ({mesh.n_cells} Faces)")
+            
+            # Optional: Alles zeigen
+            # self.viewport_3d.plotter.reset_camera()
+
+        except Exception as e:
+            from loguru import logger
+            logger.error(f"Import Fehler: {e}")
+            self.statusBar().showMessage(f"Import fehlgeschlagen: {str(e)}")
+    
     def _update_viewport_all_impl(self):
         """Das eigentliche Update, wird vom Timer aufgerufen"""
         if not HAS_PYVISTA: return
@@ -672,6 +727,7 @@ class MainWindow(QMainWindow):
         actions = {
             'new_sketch': self._new_sketch,
             'extrude': self._extrude_dialog,
+            'import_mesh': self._import_mesh_dialog,
             'export_stl': self._export_stl,
             'export_step': self._export_step,
             'export_dxf': lambda: self._show_not_implemented("DXF Export"),
@@ -709,13 +765,57 @@ class MainWindow(QMainWindow):
             'section': lambda: self._show_not_implemented("Schnittansicht"),
             'thread': lambda: self._show_not_implemented("Gewinde"),
             'pattern': lambda: self._show_not_implemented("Muster"),
+            'convert_to_brep': self._convert_selected_body_to_brep,
         }
         
         if action in actions:
             actions[action]()
         else:
             print(f"Unbekannte 3D-Aktion: {action}")
-    
+            
+    def _convert_selected_body_to_brep(self):
+        from PySide6.QtWidgets import QApplication
+
+        body = self._get_active_body()
+        if not body: 
+            self.statusBar().showMessage("Kein Körper ausgewählt.")
+            return
+
+        self.statusBar().showMessage(f"Konvertiere '{body.name}' zu BREP (bitte warten)...")
+        
+        # 1. UI kurz updaten lassen, damit der User die Nachricht sieht
+        QApplication.processEvents() 
+
+        # 2. Konvertierung starten
+        success = body.convert_to_brep()
+        
+        if success:
+            self.statusBar().showMessage(f"Erfolg! '{body.name}' ist jetzt ein CAD-Solid.")
+            
+            # 3. Browser aktualisieren (Icons ändern sich evtl.)
+            self.browser.refresh()
+            
+            # 4. VIEWPORT FIX: 
+            # Wir entfernen den Body explizit, um sicherzugehen, dass keine Reste bleiben
+            if body.id in self.viewport_3d._body_actors:
+                for actor_name in self.viewport_3d._body_actors[body.id]:
+                    try:
+                        self.viewport_3d.plotter.remove_actor(actor_name)
+                    except: pass
+            
+            # 5. Komplettes Neu-Laden aller sichtbaren Objekte anstoßen
+            # Wir rufen direkt die Implementierung auf, um den Timer zu umgehen
+            self._update_viewport_all_impl()
+            
+            # 6. Erzwinge das Rendern sofort
+            if hasattr(self.viewport_3d, 'plotter'):
+                self.viewport_3d.plotter.render()
+                self.viewport_3d.update() # Qt Widget update
+            
+        else:
+            QMessageBox.warning(self, "Fehler", "Konvertierung fehlgeschlagen.\nIst MeshLab (pymeshlab) installiert?")
+            self.statusBar().showMessage("Konvertierung fehlgeschlagen.")
+            
     def _show_not_implemented(self, feature: str):
         """Zeigt Hinweis für noch nicht implementierte Features"""
         self.statusBar().showMessage(f"⚠ {feature} - {tr('Coming soon!')}", 3000)
