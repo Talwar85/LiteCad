@@ -90,6 +90,7 @@ class ExtrudeFeature(Feature):
     direction: int = 1 
     operation: str = "New Body"
     selector: list = None 
+    precalculated_polys: list = field(default_factory=list) # NEU: Für Detector-Sync
     
     def __post_init__(self):
         self.type = FeatureType.EXTRUDE
@@ -350,212 +351,78 @@ class Body:
 
     def _compute_extrude_part(self, feature: ExtrudeFeature):
         """
-        Berechnet die Geometrie für eine Extrusion.
-        FIX: 
-        1. Area-Check (Loch muss kleiner sein als Outer).
-        2. Konzentrisch-Check (fixt Loch im Hexagon).
-        3. Robuster Extrude-Aufruf mit Keywords.
+        Berechnet die Geometrie für eine Extrusion basierend auf 
+        vordefinierten Polygonen oder einer Skizze.
         """
-        if not HAS_BUILD123D or not feature.sketch: return None
+        if not HAS_BUILD123D or not feature.sketch: 
+            return None
         
         try:
-            from shapely.geometry import LineString, Point, Polygon as ShapelyPoly
-            from shapely.ops import unary_union, polygonize
-            from build123d import make_face, Vector, Wire, extrude, Compound, Shape
-            
-            logger.info(f"--- Starte Extrusion: {feature.name} ---")
+            from build123d import make_face, Wire, extrude, Compound
             
             sketch = feature.sketch
             plane = self._get_plane_from_sketch(sketch)
-            
-            # --- 1. Segmente sammeln ---
-            all_segments = []
-            def rnd(val): return round(val, 5)
-            
-            for l in sketch.lines:
-                if not l.construction:
-                    all_segments.append(LineString([(rnd(l.start.x), rnd(l.start.y)), (rnd(l.end.x), rnd(l.end.y))]))
-            for c in sketch.circles:
-                if not c.construction:
-                    pts = [(rnd(c.center.x + c.radius * math.cos(i * 2 * math.pi / 64)), 
-                            rnd(c.center.y + c.radius * math.sin(i * 2 * math.pi / 64))) for i in range(65)]
-                    all_segments.append(LineString(pts))
-            for arc in sketch.arcs:
-                 if not arc.construction:
-                    pts = []
-                    start, end = arc.start_angle, arc.end_angle
-                    sweep = end - start
-                    if sweep < 0.1: sweep += 360
-                    steps = max(12, int(sweep / 5))
-                    for i in range(steps + 1):
-                        t = math.radians(start + sweep * i / steps)
-                        x = arc.center.x + arc.radius * math.cos(t)
-                        y = arc.center.y + arc.radius * math.sin(t)
-                        pts.append((rnd(x), rnd(y)))
-                    if len(pts) >= 2: all_segments.append(LineString(pts))
-            for spline in getattr(sketch, 'splines', []):
-                 if not getattr(spline, 'construction', False):
-                     pts_raw = []
-                     if hasattr(spline, 'get_curve_points'):
-                         pts_raw = spline.get_curve_points(segments_per_span=16)
-                     elif hasattr(spline, 'to_lines'):
-                         lines = spline.to_lines(segments_per_span=16)
-                         if lines:
-                             pts_raw.append((lines[0].start.x, lines[0].start.y))
-                             for ln in lines: pts_raw.append((ln.end.x, ln.end.y))
-                     pts = [(rnd(p[0]), rnd(p[1])) for p in pts_raw]
-                     if len(pts) >= 2: all_segments.append(LineString(pts))
-
-            if not all_segments: return None
-
-            # --- 2. Polygonize & Deduplizierung ---
-            try:
-                merged = unary_union(all_segments)
-                raw_candidates = list(polygonize(merged))
-                
-                candidates = []
-                for rc in raw_candidates:
-                    clean_poly = rc.buffer(0) # Reparatur
-                    is_dup = False
-                    for existing in candidates:
-                        if abs(clean_poly.area - existing.area) < 1e-4 and clean_poly.centroid.distance(existing.centroid) < 1e-4:
-                            is_dup = True
-                            break
-                    if not is_dup:
-                        candidates.append(clean_poly)
-                
-                logger.info(f"Kandidaten (Unique): {len(candidates)}")
-            except Exception as e:
-                logger.error(f"Polygonize failed: {e}")
-                return None
-            
-            if not candidates: return None
-
-            # --- 3. Selektion ---
-            selected_indices = set()
-            if feature.selector:
-                selectors = feature.selector
-                if isinstance(selectors, tuple) and len(selectors) == 2 and isinstance(selectors[0], (int, float)):
-                    selectors = [selectors]
-                
-                for sel_pt in selectors:
-                    pt = Point(sel_pt)
-                    matches = []
-                    for i, poly in enumerate(candidates):
-                        if poly.contains(pt) or poly.distance(pt) < 1e-2:
-                            matches.append(i)
-                    if matches:
-                        best = min(matches, key=lambda i: candidates[i].area)
-                        selected_indices.add(best)
-            else:
-                selected_indices = set(range(len(candidates)))
-
-            if not selected_indices: return None
-
-            # --- 4. Faces bauen ---
             faces_to_extrude = []
 
-            def to_3d_wire(shapely_poly):
-                try:
-                    pts_2d = list(shapely_poly.exterior.coords[:-1])
-                    if len(pts_2d) < 3: return None
-                    pts_3d = [plane.from_local_coords((p[0], p[1])) for p in pts_2d]
-                    return Wire.make_polygon(pts_3d)
-                except: return None
+            # Hilfsfunktion: Konvertiert ein Shapely-Polygon (mit Löchern) in ein build123d Face
+            def shapely_to_b123_face(poly):
+                # Außenkontur (Wandle 2D-Koordinaten in 3D-Koordinaten auf der Plane um)
+                outer_pts = [plane.from_local_coords((p[0], p[1])) for p in poly.exterior.coords[:-1]]
+                face = make_face(Wire.make_polygon(outer_pts))
+                # Löcher abziehen (Shapely interiors sind bereits korrekt orientiert)
+                for interior in poly.interiors:
+                    inner_pts = [plane.from_local_coords((p[0], p[1])) for p in interior.coords[:-1]]
+                    face -= make_face(Wire.make_polygon(inner_pts))
+                return face
 
-            for outer_idx in selected_indices:
-                try:
-                    outer_poly = candidates[outer_idx]
-                    outer_wire = to_3d_wire(outer_poly)
-                    if not outer_wire: continue
-                    
-                    main_face = make_face(outer_wire)
-                    
-                    # Löcher suchen
-                    for i, potential_hole in enumerate(candidates):
-                        if i == outer_idx: continue
-                        
-                        # WICHTIG 1: Ein Loch muss kleiner sein!
-                        if potential_hole.area >= outer_poly.area * 0.99:
-                            continue
+            # PFAD A: Wir nutzen die exakten Polygone vom GeometryDetector (Sync!)
+            if hasattr(feature, 'precalculated_polys') and feature.precalculated_polys:
+                for poly in feature.precalculated_polys:
+                    faces_to_extrude.append(shapely_to_b123_face(poly))
+            
+            # PFAD B: Fallback für Rebuilds (z.B. beim Laden einer Datei)
+            else:
+                logger.info(f"Rebuild Extrude: Nutze automatische Erkennung für {feature.name}")
+                # Hier rufen wir die zentrale Logik auf, um Polygone aus der Skizze zu extrahieren
+                # Wir nutzen hierfür temporär die Logik, die auch im Detector steckt
+                # [Diese Logik ist bereits in deinem alten modeling.py Code enthalten]
+                # Fallback: Extrahiere Polygone basierend auf feature.selector oder nimm alle
+                raw_polys = self._extract_polygons_from_sketch(sketch) # Siehe unten
+                
+                # Wenn Selektoren da sind, filtern; sonst alle nehmen
+                for poly in raw_polys:
+                    if not feature.selector:
+                        faces_to_extrude.append(shapely_to_b123_face(poly))
+                    else:
+                        from shapely.geometry import Point
+                        # Prüfe ob einer der Selektor-Punkte im Polygon liegt
+                        for sel_pt in feature.selector:
+                            if poly.contains(Point(sel_pt)) or poly.distance(Point(sel_pt)) < 1e-2:
+                                faces_to_extrude.append(shapely_to_b123_face(poly))
+                                break
 
-                        # Check: Ist es drinnen?
-                        is_inside = False
-                        reason = ""
-                        
-                        try:
-                            # A) Konzentrisch (Sehr starkes Indiz für Loch)
-                            if outer_poly.centroid.distance(potential_hole.centroid) < 1e-3:
-                                is_inside = True; reason = "Concentric"
-                            
-                            # B) Intersection
-                            elif not is_inside:
-                                intersect = outer_poly.intersection(potential_hole)
-                                ratio = intersect.area / potential_hole.area if potential_hole.area > 0 else 0
-                                if ratio > 0.9: 
-                                    is_inside = True; reason = f"Overlap {ratio:.2f}"
-                                
-                            # C) Centroid Check
-                            if not is_inside:
-                                if outer_poly.contains(potential_hole.centroid):
-                                    is_inside = True; reason = "Centroid"
-                        except: pass
+            if not faces_to_extrude:
+                return None
 
-                        if is_inside:
-                            # Nur schneiden, wenn nicht selbst ausgewählt
-                            if i not in selected_indices:
-                                logger.info(f"  -> Schneide Loch #{i} ({reason})")
-                                hole_wire = to_3d_wire(potential_hole)
-                                if hole_wire:
-                                    try:
-                                        hole_face = make_face(hole_wire)
-                                        main_face = main_face - hole_face
-                                    except Exception as e:
-                                        logger.warning(f"Cut failed: {e}")
-
-                    faces_to_extrude.append(main_face)
-                except Exception as e:
-                    logger.error(f"Face construction error: {e}")
-
-            if not faces_to_extrude: return None
-
-            # --- 5. Extrudieren ---
+            # --- Extrudieren ---
             solids = []
             amount = feature.distance * feature.direction
-            direction_vec = plane.z_dir 
             
             for f in faces_to_extrude:
-                try:
-                    # Versuche globale Funktion mit Keywords
-                    s = extrude(f, amount=amount, dir=direction_vec)
-                    if s and s.is_valid():
-                        solids.append(s)
-                    else:
-                        raise ValueError("Invalid result")
-                except Exception:
-                    # Fallback: Methoden-Aufruf mit expliziten Keywords
-                    try:
-                        # Manche Versionen verlangen 'amount' und 'dir' explizit
-                        if hasattr(f, 'extrude'):
-                             s = f.extrude(amount=amount, dir=direction_vec)
-                             if s: solids.append(s)
-                    except Exception as ex2:
-                        logger.error(f"Extrude failed for face: {ex2}")
+                # Nutze die robusteste Form des Aufrufs mit expliziten Richtungsvektoren
+                s = extrude(f, amount=amount, dir=plane.z_dir)
+                if s and s.is_valid():
+                    solids.append(s)
 
             if not solids: 
-                logger.warning("Keine Solids erzeugt!")
                 return None
             
-            logger.success(f"Extrusion OK: {len(solids)} Solids erzeugt.")
-
-            if len(solids) == 1:
-                return solids[0]
-            else:
-                return Compound(children=solids)
+            # Ergebnis zurückgeben (Einzelner Solid oder Verbund)
+            return solids[0] if len(solids) == 1 else Compound(children=solids)
             
         except Exception as e:
-            logger.error(f"Extrude CRASH: {e}")
-            raise e
+            logger.error(f"Extrude Error in Kernel: {e}")
+            return None
 
 
 

@@ -1114,6 +1114,7 @@ class MainWindow(QMainWindow):
 
     def _extrude_dialog(self):
         """Startet den Extrude-Modus mit sichtbarem Input-Panel"""
+        self._update_detector()
         self.viewport_3d.set_extrude_mode(True)
         self.extrude_panel.reset()
         
@@ -1142,15 +1143,9 @@ class MainWindow(QMainWindow):
         height = self.extrude_panel.get_height()
         operation = self.extrude_panel.get_operation()
         
-        # Hole die selektierten Faces vom Viewport
-        if hasattr(self.viewport_3d, 'selected_faces') and self.viewport_3d.selected_faces:
-            faces = list(self.viewport_3d.selected_faces)
-            
-            # Starte die eigentliche Extrusion
-            self._on_extrusion_finished(faces, height, operation)
-            
-        else:
-            self.statusBar().showMessage("Keine Fläche ausgewählt!")
+        # Wir übergeben None für die Indizes, da _on_extrusion_finished 
+        # jetzt direkt den Detector im Viewport abfragt.
+        self._on_extrusion_finished(None, height, operation)
     
     def _on_extrude_cancelled(self):
         """Extrude abgebrochen"""
@@ -1163,75 +1158,92 @@ class MainWindow(QMainWindow):
     def _on_toggle_bodies_visibility(self, hide: bool):
         """Toggle alle Bodies sichtbar/unsichtbar im Extrude-Modus"""
         self.viewport_3d.set_all_bodies_visible(not hide)
-
-    def _on_extrusion_finished(self, face_indices, height, operation="New Body"):
-        """Erstellt parametrische Extrusionen"""
-        if not face_indices or abs(height) < 0.001:
-            self._finish_extrusion_ui(success=False)
+        
+    
+    def _update_detector(self):
+        """Lädt alle relevanten Geometrien in den GeometryDetector des Viewports"""
+        if not hasattr(self.viewport_3d, 'detector') or self.viewport_3d.detector is None:
             return
 
-        sketch_faces_indices = []
-        body_faces_data = []
-        target_sketch = None
-
-        # Sortiere Selektion: Sketch-Faces oder Body-Faces?
-        if hasattr(self.viewport_3d, 'detected_faces'):
-            for idx in face_indices:
-                if 0 <= idx < len(self.viewport_3d.detected_faces):
-                    face = self.viewport_3d.detected_faces[idx]
-                    if face.get('type') == 'body_face':
-                        body_faces_data.append(face)
-                    else:
-                        sketch_faces_indices.append(idx)
-                        if target_sketch is None: target_sketch = face.get('sketch')
-
-        if HAS_BUILD123D:
-            success = False
+        self.viewport_3d.detector.clear()
+        
+        # 1. Sichtbare Sketches verarbeiten
+        visible_sketches = self.browser.get_visible_sketches()
+        for sketch, _ in visible_sketches:
+            plane = self._get_plane_from_sketch(sketch)
+            self.viewport_3d.detector.process_sketch(
+                sketch, 
+                tuple(plane.origin), 
+                tuple(plane.z_dir), 
+                tuple(plane.x_dir)
+            )
             
-            # FALL A: Sketch Extrusion (Parametrisch)
-            if sketch_faces_indices and target_sketch:
-                try:
-                    # Sammle Zentrumspunkte der gewählten Profile als Selektor
-                    selector_points = []
-                    for idx in sketch_faces_indices:
-                        f = self.viewport_3d.detected_faces[idx]
-                        selector_points.append(f.get('center_2d'))
+        # 2. Sichtbare Bodies verarbeiten (für Body-Face Selection / Push-Pull)
+        visible_bodies = self.browser.get_visible_bodies()
+        for body, _ in visible_bodies:
+            # Nutze bevorzugt das vtk_mesh für die schnelle Erkennung
+            mesh = getattr(body, 'vtk_mesh', None)
+            if mesh:
+                self.viewport_3d.detector.process_body_mesh(body.id, mesh)
+    
+    def _get_plane_from_sketch(self, sketch):
+        """Erstellt ein build123d Plane Objekt aus den Sketch-Metadaten"""
+        from build123d import Plane, Vector
+        return Plane(
+            origin=Vector(sketch.plane_origin),
+            z_dir=Vector(sketch.plane_normal),
+            x_dir=Vector(sketch.plane_x_dir)
+        )
+    
+    def _on_extrusion_finished(self, face_indices, height, operation="New Body"):
+        """Erstellt die finale Geometrie basierend auf der Auswahl im Detector"""
+        # 1. Sammle alle selektierten Face-Objekte vom Detector
+        selection_data = []
+        for fid in self.viewport_3d.selected_face_ids:
+            face = next((f for f in self.viewport_3d.detector.faces if f.id == fid), None)
+            if face: selection_data.append(face)
+        
+        if not selection_data: 
+            self.statusBar().showMessage("Nichts selektiert.")
+            return
 
-                    # Erstelle FEATURE Objekt
-                    feature = ExtrudeFeature(
-                        sketch=target_sketch,
-                        distance=height,
-                        operation=operation,
-                        selector=selector_points 
-                    )
-                    
-                    target_body = self._get_active_body()
-                    if operation == "New Body" or not target_body:
-                        target_body = self.document.new_body()
-                        feature.operation = "New Body"
+        # Fall A: Klassische Sketch-Extrusion
+        if selection_data[0].type == 'sketch':
+            try:
+                source_id = selection_data[0].sketch_id
+                target_sketch = next((s for s in self.document.sketches if s.id == source_id), None)
+                
+                feature = ExtrudeFeature(
+                    sketch=target_sketch,
+                    distance=height,
+                    operation=operation,
+                    precalculated_polys=[f.shapely_poly for f in selection_data]
+                )
+                
+                target_body = self._get_active_body()
+                if operation == "New Body" or not target_body:
+                    target_body = self.document.new_body()
+                
+                target_body.add_feature(feature)
+                self._update_body_mesh(target_body)
+                self._finish_extrusion_ui(msg=f"Extrusion auf {target_body.name} angewendet")
+            except Exception as e:
+                logger.error(f"Sketch Extrude Error: {e}")
 
-                    # Hinzufügen triggert Rebuild
-                    target_body.add_feature(feature)
-                    
-                    # Update Visuals
-                    self._update_body_mesh(target_body, None)
-                    success = True
-                        
-                except Exception as e:
-                    logger.error(f"BREP Extrusion Error: {e}")
-
-            # FALL B: Body Face (Push/Pull)
-            elif body_faces_data:
-                 for face_data in body_faces_data:
-                      if self._extrude_body_face_build123d(face_data, height, operation):
-                           success = True
-
+        # Fall B: Body-Face Extrusion (Push/Pull)
+        elif selection_data[0].type == 'body':
+            # Nutzt die bestehende Build123d Push/Pull Logik
+            # (Nimmt aktuell nur die erste selektierte Fläche für Push/Pull)
+            success = self._extrude_body_face_build123d({
+                'body_id': selection_data[0].body_id,
+                'center_3d': selection_data[0].center,
+                'normal': selection_data[0].plane_normal
+            }, height, operation)
+            
             if success:
-                self._finish_extrusion_ui(success=True, msg=f"Extrusion ({operation}) erstellt.")
-                return
-
-        # Fallback
-        self._finish_extrusion_ui(success=False, msg="Extrusion fehlgeschlagen.")
+                self._finish_extrusion_ui(msg="Push/Pull erfolgreich angewendet")
+            else:
+                logger.error("Push/Pull fehlgeschlagen. Konvertiere Mesh evtl. erst zu BREP.")
 
     def _finish_extrusion_ui(self, success=True, msg=""):
         """Hilfsfunktion zum Aufräumen der UI"""
@@ -1681,11 +1693,14 @@ class MainWindow(QMainWindow):
                     self.extrude_panel.height_input.selectAll()
                     return True
             
-            # Enter - bestätigt Extrusion
+           
+            # Enter - bestätigt Extrusion (FIXED: Nutzt selected_face_ids vom Detector)
             if k in (Qt.Key_Return, Qt.Key_Enter):
-                if self.viewport_3d.extrude_mode and self.viewport_3d.selected_faces:
-                    self._on_extrude_confirmed()
-                    return True
+                if self.viewport_3d.extrude_mode:
+                    # Wir prüfen den Detector im Viewport
+                    if self.viewport_3d.selected_face_ids:
+                        self._on_extrude_confirmed()
+                        return True
             
             # Escape - bricht ab
             if k == Qt.Key_Escape:

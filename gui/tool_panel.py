@@ -197,6 +197,30 @@ class ToolPanel(QFrame):
         draw_group.setLayout(draw_layout)
         layout.addWidget(draw_group)
         
+        
+        # === SHAPES (Sonderformen) ===
+        shapes_group = self._create_group(tr("Shapes"))
+        shapes_layout = QGridLayout()
+        shapes_layout.setSpacing(4)
+        
+        tools_shapes = [
+            (f"⚙ {tr('Gear')}", "gear", "", "Gear", 0, 0),
+            (f"★ {tr('Star')}", "star", "", "Star", 0, 1),
+            (f"⬢ {tr('Nut')}", "nut", "", "Nut", 1, 0),
+            (f"A {tr('Text')}", "text", "", "Text", 1, 1),
+        ]
+        
+        for text, name, shortcut, key, row, col in tools_shapes:
+            btn = ToolButton(text, shortcut, tr(key))
+            btn.clicked.connect(lambda checked, n=name: self._on_tool_clicked(n))
+            self.buttons[name] = btn
+            self.button_group.addButton(btn)
+            shapes_layout.addWidget(btn, row, col)
+            
+        shapes_group.setLayout(shapes_layout)
+        layout.addWidget(shapes_group)
+        
+        
         # === BEARBEITEN ===
         edit_group = self._create_group(tr("Modify"))
         edit_layout = QGridLayout()

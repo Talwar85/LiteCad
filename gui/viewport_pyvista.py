@@ -7,6 +7,7 @@ import math
 import numpy as np
 from typing import Optional, List, Tuple, Dict, Any
 import uuid
+from gui.geometry_detector import GeometryDetector
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QFrame, QLabel, QToolButton
 from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QPoint
@@ -111,6 +112,8 @@ class PyVistaViewport(QWidget):
         self._face_actors = []
         self._preview_actor = None
         self.last_highlighted_plane = None
+        self.detector = GeometryDetector()
+        self.selected_face_ids = set()
         
         self.setFocusPolicy(Qt.StrongFocus)
         
@@ -403,7 +406,32 @@ class PyVistaViewport(QWidget):
         if lines:
             grid = pv.MultiBlock(lines).combine()
             self.plotter.add_mesh(grid, color='#3a3a3a', line_width=1, name='grid_main', pickable=False)
-            
+    
+    def _cache_drag_direction_for_face_v2(self, face):
+        """Berechnet den 2D-Bildschirmvektor für die Extrusionsrichtung"""
+        # Normalenvektor der Fläche (3D)
+        normal = np.array(face.plane_normal)
+        center = np.array(face.center)
+
+        def world_to_display(pt):
+            self.plotter.renderer.SetWorldPoint(pt[0], pt[1], pt[2], 1.0)
+            self.plotter.renderer.WorldToDisplay()
+            d_pt = self.plotter.renderer.GetDisplayPoint()
+            # VTK y-0 ist unten, Qt y-0 ist oben
+            return np.array([d_pt[0], self.plotter.interactor.height() - d_pt[1]])
+
+        p_start = world_to_display(center)
+        p_end = world_to_display(center + normal * 10.0)
+        vec = p_end - p_start
+        
+        # Normierung des Vektors
+        norm = np.linalg.norm(vec)
+        if norm < 0.1:
+            self._drag_screen_vector = np.array([1.0, 0.0]) # Fallback
+        else:
+            self._drag_screen_vector = vec / norm
+
+    
     def is_body_visible(self, body_id):
         if body_id not in self._body_actors: return False
         try:
@@ -428,122 +456,89 @@ class PyVistaViewport(QWidget):
     # ==================== EVENT FILTER ====================
     def eventFilter(self, obj, event):
         if not HAS_PYVISTA: return False
-        
-        # Import für Keyboard Modifiers
         from PySide6.QtWidgets import QApplication
-        
-        if event.type() == QEvent.MouseButtonPress:
-            if event.button() == Qt.LeftButton:
+
+        # --- 1. EBENEN-AUSWAHL ---
+        if self.plane_select_mode:
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                pos = event.position() if hasattr(event, 'position') else event.pos()
+                self._pick_plane_at_position(int(pos.x()), int(pos.y()))
+                return True
+            if event.type() == QEvent.MouseMove:
+                pos = event.position() if hasattr(event, 'position') else event.pos()
+                self._highlight_plane_at_position(int(pos.x()), int(pos.y()))
+            return False
+
+        # --- 2. EXTRUDE-MODUS ---
+        if self.extrude_mode:
+            # Maus-Bewegung (Hover & Drag)
+            if event.type() == QEvent.MouseMove:
                 pos = event.position() if hasattr(event, 'position') else event.pos()
                 x, y = int(pos.x()), int(pos.y())
-                
-                if self.parent(): self.parent().setFocus()
-                self.setFocus()
-                
-                if self.plane_select_mode: 
-                    self._pick_plane_at_position(x, y)
+
+                # Dragging (Aktiv am Ziehen)
+                if getattr(self, 'is_dragging', False):
+                    delta = self._calculate_extrude_delta(pos)
+                    self.show_extrude_preview(self.drag_start_height + delta)
+                    self.height_changed.emit(self.extrude_height)
                     return True
-                    
-                elif self.extrude_mode:
-                    # SMART DRAG START: Wir merken uns nur, dass geklickt wurde.
-                    # Ob es ein Klick (Selektion) oder Drag (Extrude) wird, entscheidet die Bewegung.
-                    
+                
+                # Potential Drag (Warten auf 5px Bewegung)
+                elif getattr(self, '_is_potential_drag', False):
+                    if (pos - self._potential_drag_start).manhattanLength() > 5:
+                        self.is_dragging = True
+                        self._is_potential_drag = False
+                        self.drag_start_pos = self._potential_drag_start
+                        self.drag_start_height = self.extrude_height
+                        return True
+                
+                # Reiner Hover (keine Taste)
+                elif not (event.buttons() & Qt.LeftButton):
+                    ray_o, ray_d = self.get_ray_from_click(x, y)
+                    hit_id = self.detector.pick_face(ray_o, ray_d)
+                    if hit_id != getattr(self, 'hovered_face', -1):
+                        self.hovered_face = hit_id
+                        self._draw_selectable_faces_from_detector()
+                return False
+
+            # Klick (Start Selektion / Drag)
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                pos = event.position() if hasattr(event, 'position') else event.pos()
+                x, y = int(pos.x()), int(pos.y())
+                ray_o, ray_d = self.get_ray_from_click(x, y)
+                hit_id = self.detector.pick_face(ray_o, ray_d)
+                
+                if hit_id != -1:
                     self._potential_drag_start = pos
                     self._is_potential_drag = True
-                    self.is_dragging = False # Noch nicht dragging!
                     
-                    # Wir prüfen SOFORT, was unter der Maus ist, um die Drag-Richtung vorzubereiten
-                    # Aber wir ändern die Selektion noch nicht!
-                    
-                    # Prüfe auf Sketch/Body Face unter Maus
-                    face_idx = self._pick_face_index_at(x, y)
-                    
-                    if face_idx != -1:
-                        # Cache Richtung für den Fall, dass gleich gezogen wird
-                        self._cache_drag_direction_for_face(face_idx)
-                        return True # Event konsumieren
-                    
-                    # Nichts getroffen? Kamera erlauben
-                    self._is_potential_drag = False
-                    return False
-                else:
-                    self._handle_3d_click(x, y)
-                    # Wir geben False zurück, damit PyVista Kamera-Steuerung noch geht,
-                    # es sei denn wir sind in einem speziellen Selection Mode
-                    return False       
-        elif event.type() == QEvent.MouseMove:
-            pos = event.position() if hasattr(event, 'position') else event.pos()
-            x, y = int(pos.x()), int(pos.y())
-            
-            # 1. Extrude Dragging
-            if self.extrude_mode:
-                if self.is_dragging:
-                    # Wir sind bereits im Drag-Modus -> Extrudieren
-                    delta = self._calculate_extrude_delta(pos)
-                    new_height = self.drag_start_height + delta
-                    
-                    if abs(new_height - self.extrude_height) > 0.01:
-                        self.show_extrude_preview(new_height)
-                        self.height_changed.emit(self.extrude_height)
-                    return True
-                
-                elif getattr(self, '_is_potential_drag', False):
-                    # Wir haben gedrückt und bewegen jetzt die Maus -> Prüfen ob Drag startet
-                    dist = (pos - self._potential_drag_start).manhattanLength()
-                    if dist > 5: # Schwellenwert von 5 Pixeln
-                        # START DRAG!
-                        self.is_dragging = True
-                        self._is_potential_drag = False # Kein Klick mehr
-                        self.drag_start_pos = self._potential_drag_start # Start war beim Klick
-                        self.drag_start_height = self.extrude_height
-                        
-                        # Logik: Wenn wir auf einer Fläche ziehen, die noch nicht ausgewählt ist,
-                        # wählen wir sie jetzt automatisch aus (für "Click & Drag" in einem Rutsch).
-                        modifiers = QApplication.keyboardModifiers()
-                        is_multi = (modifiers & Qt.ControlModifier) or (modifiers & Qt.ShiftModifier)
-                        
-                        face_idx = self._pick_face_index_at(int(self._potential_drag_start.x()), int(self._potential_drag_start.y()))
-                        if face_idx != -1:
-                            if face_idx not in self.selected_faces and not is_multi:
-                                # Neue Einzelauswahl für Drag
-                                self.selected_faces.clear()
-                                self.selected_faces.add(face_idx)
-                                self._draw_selectable_faces()
-                                self.face_selected.emit(face_idx)
-                                # Richtung neu cachen, da sich Auswahl geändert hat
-                                self._cache_drag_direction_for_face(face_idx)
-                        
-                        return True
-                    return True # Event konsumieren, solange wir im "Wackelbereich" sind
-
-            # 2. Hover Effekte (nur wenn nicht gedrückt)
-            if self.plane_select_mode:
-                self._highlight_plane_at_position(x, y)
-                return False
-            
-            if self.extrude_mode and not self.is_dragging and not getattr(self, '_is_potential_drag', False):
-                self._pick_face_at_position(x, y, hover_only=True)
-                return False
-
-        elif event.type() == QEvent.MouseButtonRelease:
-            if event.button() == Qt.LeftButton:
-                # War es ein Drag?
-                if self.is_dragging and self.extrude_mode:
-                    self.is_dragging = False
-                    self._is_potential_drag = False
-                    return True
-                
-                # War es ein Klick (ohne viel Bewegung)?
-                if getattr(self, '_is_potential_drag', False) and self.extrude_mode:
-                    self._is_potential_drag = False
-                    # JETZT führen wir die Selektion durch
                     modifiers = QApplication.keyboardModifiers()
-                    is_multi = (modifiers & Qt.ControlModifier) or (modifiers & Qt.ShiftModifier)
+                    if modifiers & Qt.ControlModifier:
+                        if hit_id in self.selected_face_ids: self.selected_face_ids.remove(hit_id)
+                        else: self.selected_face_ids.add(hit_id)
+                    else:
+                        if hit_id not in self.selected_face_ids:
+                            self.selected_face_ids = {hit_id}
                     
-                    x, y = int(event.position().x()), int(event.position().y())
-                    self._handle_selection_click(x, y, is_multi)
+                    face = next((f for f in self.detector.faces if f.id == hit_id), None)
+                    if face:
+                        self._cache_drag_direction_for_face_v2(face)
+                    
+                    self._draw_selectable_faces_from_detector()
                     return True
-                
+                return False
+
+            # Release
+            if event.type() == QEvent.MouseButtonRelease:
+                self.is_dragging = False
+                self._is_potential_drag = False
+
+        # --- 3. STANDARD-MODUS ---
+        if not self.extrude_mode and not self.plane_select_mode:
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                pos = event.position() if hasattr(event, 'position') else event.pos()
+                self._handle_3d_click(int(pos.x()), int(pos.y()))
+
         return False
     
     def _handle_3d_click(self, x, y):
@@ -972,24 +967,63 @@ class PyVistaViewport(QWidget):
 
     def set_extrude_mode(self, enabled):
         self.extrude_mode = enabled
-        self.selected_faces.clear()
-        self.hovered_face = -1
-        self.hovered_body_face = None
-        self.body_face_extrude = None
-        self.is_dragging = False; self.extrude_height = 0.0
-        if enabled: 
-            self._detect_faces()          # Sketch-Faces
-            self._detect_body_faces()     # Body-Faces hinzufügen!
-            self._draw_selectable_faces()
-            self._clear_body_face_highlight()
-        else: 
-            self._clear_face_actors(); self._clear_preview()
-            self._restore_body_colors()   # Farben wiederherstellen
-            self._clear_body_face_highlight()
-            try:
-                self.plotter.remove_actor('body_face_selection')
-            except: pass
-    
+        self.selected_face_ids.clear()
+        
+        if enabled:
+            # 1. Detector füttern (Passiert eigentlich im MainWindow, aber hier als Trigger)
+            # Besser: MainWindow ruft detector.process... auf und dann viewport.update()
+            # Wir nehmen an, der Detector ist bereits aktuell oder wird hier aktualisiert.
+            
+            # 2. Visualisierung
+            self._draw_selectable_faces_from_detector()
+        else:
+            self._clear_face_actors()
+            self._clear_preview()
+            
+    def get_extrusion_data_for_kernel(self):
+        """Gibt die Shapely-Polygone für den Kernel zurück"""
+        data = []
+        for fid in self.selected_face_ids:
+            # Suche Face im Detector
+            face = next((f for f in self.detector.faces if f.id == fid), None)
+            if face and face.type == 'sketch':
+                data.append({
+                    'poly': face.shapely_poly,
+                    'sketch_id': face.sketch_id
+                })
+        return data
+        
+    def _draw_selectable_faces_from_detector(self):
+        """Zeichnet Faces basierend auf Detector-Daten (inkl. Hover)"""
+        self._clear_face_actors()
+        
+        for face in self.detector.faces:
+            is_selected = face.id in self.selected_face_ids
+            is_hovered = (face.id == getattr(self, 'hovered_face', -1))
+            
+            if not is_selected and not is_hovered:
+                continue
+                
+            # Farbe bestimmen
+            if is_selected:
+                color = 'orange'
+                opacity = 0.6
+            else: # nur hovered
+                color = 'cyan'
+                opacity = 0.4
+            
+            if face.display_mesh:
+                name = f"det_face_{face.id}"
+                # Kleiner Offset gegen Z-Fighting
+                offset = np.array(face.plane_normal) * 0.1
+                shifted = face.display_mesh.translate(offset, inplace=False)
+                
+                self.plotter.add_mesh(shifted, color=color, opacity=opacity, name=name, pickable=False)
+                self._face_actors.append(name)
+        
+        self.plotter.render()
+        
+        
     def set_edge_select_mode(self, enabled):
         """Aktiviert/deaktiviert den Edge-Selection-Modus für Fillet/Chamfer"""
         self.edge_select_mode = getattr(self, 'edge_select_mode', False)
@@ -1570,45 +1604,41 @@ class PyVistaViewport(QWidget):
         return []
     
     def show_extrude_preview(self, height):
-        self._clear_preview(); self.extrude_height = height
+        """Zeigt eine dynamische 3D-Vorschau für alle selektierten Flächen (Sketch & Body)"""
+        self._clear_preview()
+        self.extrude_height = height
         
-        if not self.selected_faces or abs(height) < 0.1: 
+        if not self.selected_face_ids or abs(height) < 0.1: 
             return
-        
-        all_verts = []
-        all_faces = []
-        vert_offset = 0
-        
-        for idx in self.selected_faces:
-            if idx < 0 or idx >= len(self.detected_faces): 
-                continue
+
+        try:
+            import pyvista as pv
+            preview_meshes = []
             
-            face = self.detected_faces[idx]
-            
-            # Body-Face oder Sketch-Face?
-            if face.get('type') == 'body_face':
-                v, f = self._calculate_body_face_extrusion(face, height)
-            else:
-                v, f = self.get_extrusion_data(idx, height)
-            
-            if v and f:
-                # Offset für Faces anpassen
-                for fv in f:
-                    all_faces.append(tuple(vi + vert_offset for vi in fv))
-                all_verts.extend(v)
-                vert_offset = len(all_verts)
-        
-        if all_verts:
-            vv = np.array(all_verts, dtype=np.float32)
-            ff = []
-            for face in all_faces: 
-                ff.extend([3] + list(face))
-            mesh = pv.PolyData(vv, np.array(ff, dtype=np.int32))
-            self._preview_actor = 'prev'
-            col = '#6699ff' if height > 0 else '#ff6666'  # Blau für Add, Rot für Cut
-            self.plotter.add_mesh(mesh, color=col, opacity=0.8, name='prev')
-        
-        self.plotter.update()
+            for fid in self.selected_face_ids:
+                # Hole Face-Daten vom Detector
+                face = next((f for f in self.detector.faces if f.id == fid), None)
+                if face and face.display_mesh:
+                    normal = np.array(face.plane_normal)
+                    # Erzeuge temporäres Extrusions-Mesh
+                    # Da display_mesh bereits die korrekte 3D-Lage hat, reicht einfaches .extrude()
+                    p_mesh = face.display_mesh.extrude(normal * height, capping=True)
+                    preview_meshes.append(p_mesh)
+
+            if preview_meshes:
+                # Alle Vorschau-Meshes zu einem Actor kombinieren
+                combined = preview_meshes[0]
+                for i in range(1, len(preview_meshes)):
+                    combined = combined.merge(preview_meshes[i])
+                
+                # Farbe basierend auf Richtung (Blau für Positiv, Rot für Negativ/Cut)
+                col = '#6699ff' if height > 0 else '#ff6666'
+                self.plotter.add_mesh(combined, color=col, opacity=0.5, name='prev', pickable=False)
+                self._preview_actor = 'prev'
+                self.plotter.render()
+                
+        except Exception as e:
+            print(f"Viewport Preview Error: {e}")
     
     def _calculate_body_face_extrusion(self, face, height):
         """Berechnet vollständige Extrusion für eine Body-Fläche inkl. Seitenwände"""

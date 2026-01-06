@@ -138,10 +138,13 @@ class ExtrudeInputPanel(QFrame):
         self.height_changed.emit(val)
         
     def _confirm(self):
+        # Wir holen den aktuellen Wert direkt aus der Spinbox
         self._height = self.height_input.value()
-        if abs(self._height) < 0.001:
-            return 
-        self.confirmed.emit()
+        # Nur bestätigen, wenn wirklich Geometrie entstehen kann (> 0.001mm)
+        if abs(self._height) > 0.001:
+            self.confirmed.emit()
+        else:
+            self.cancelled.emit()
 
     def _toggle_vis(self):
         self._bodies_hidden = self.btn_vis.isChecked()
