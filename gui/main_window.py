@@ -1234,7 +1234,7 @@ class MainWindow(QMainWindow):
     def _on_extrusion_finished(self, face_indices, height, operation="New Body"):
         """Erstellt die finale Geometrie basierend auf der Auswahl im Detector"""
         
-        # FIX 1: Verhindere doppelte Ausführung (Panel Enter + Viewport Enter)
+        # FIX 1: Verhindere doppelte Ausführung
         if getattr(self, '_is_processing_extrusion', False):
             return
         self._is_processing_extrusion = True
@@ -1272,14 +1272,14 @@ class MainWindow(QMainWindow):
                     if operation == "New Body" or not target_body:
                         target_body = self.document.new_body()
                     
+                    # WICHTIG: add_feature ruft intern bereits _rebuild() auf!
                     target_body.add_feature(feature)
                     
-                    # Logik-Rebuild
-                    if hasattr(target_body, '_rebuild'):
-                        target_body._rebuild()
+                    # --- GELÖSCHT: Doppelter Rebuild entfernt ---
+                    # if hasattr(target_body, '_rebuild'):
+                    #    target_body._rebuild()
                     
-                    # FIX 2: Visuelles Update erzwingen!
-                    # Ohne das hier weiß der Viewport nicht, dass es neue Dreiecke gibt.
+                    # FIX 2: Visuelles Update erzwingen
                     self._update_body_mesh(target_body)
                     
                     self._finish_extrusion_ui(msg=f"Extrusion erstellt: {target_body.name}")
@@ -1303,7 +1303,6 @@ class MainWindow(QMainWindow):
                     self.statusBar().showMessage("Push/Pull fehlgeschlagen.")
         
         finally:
-            # Sperre wieder freigeben
             self._is_processing_extrusion = False
 
     def _finish_extrusion_ui(self, success=True, msg=""):

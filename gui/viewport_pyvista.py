@@ -169,25 +169,17 @@ class PyVistaViewport(QWidget):
     
     
     def _update_hover(self, face_id):
-        if face_id == self.hover_face_id:
+        """
+        Aktualisiert den Hover-Status und zeichnet die Szene neu.
+        Nutzt jetzt die optimierte _draw_selectable_faces_from_detector Methode.
+        """
+        if face_id == getattr(self, 'hover_face_id', -1):
             return
-            
-        # Altes Hover Mesh löschen
-        if self.hover_face_id != -1:
-            self.plotter.remove_actor(f"hover_{self.hover_face_id}")
 
         self.hover_face_id = face_id
-
-        # Neues Hover Mesh zeichnen
-        if face_id != -1:
-            face = next((f for f in self.detector.selection_faces if f.id == face_id), None)
-            if face and face.display_mesh:
-                # Kleiner Offset gegen Z-Fighting
-                offset = np.array(face.plane_normal) * 0.05
-                m = face.display_mesh.translate(offset, inplace=False)
-                self.plotter.add_mesh(m, color="cyan", opacity=0.4, name=f"hover_{face_id}", pickable=False)
         
-        self.plotter.render()
+        # Zeichnen aktualisieren (das kümmert sich jetzt um Hover UND Selection)
+        self._draw_selectable_faces_from_detector()
         
     def _set_face_highlight(self, face_id, state):
         face = next(
@@ -485,26 +477,67 @@ class PyVistaViewport(QWidget):
             self.plotter.add_mesh(grid, color='#3a3a3a', line_width=1, name='grid_main', pickable=False)
     
     def _cache_drag_direction_for_face_v2(self, face):
-        """Berechnet den 2D-Bildschirmvektor für die Extrusionsrichtung"""
-        normal = np.array(face.plane_normal)
-        # FIX: Nutze plane_origin, da SelectionFace kein Attribut 'center' hat
-        center = np.array(face.plane_origin) 
+        """
+        Berechnet den 2D-Bildschirmvektor für die Extrusionsrichtung.
+        Robustere Version, die Fallbacks nutzt, damit Push/Pull immer geht.
+        """
+        try:
+            # Daten vorbereiten
+            normal = np.array(face.plane_normal, dtype=float)
+            if np.linalg.norm(normal) < 1e-6: normal = np.array([0,0,1], dtype=float)
+            
+            # Zentrum bestimmen
+            if face.domain_type == 'body_face':
+                 center = np.array(face.plane_origin, dtype=float)
+            else:
+                 # Sketch Face: Zentrum aus Polygon berechnen
+                 poly = face.shapely_poly
+                 c2d = poly.centroid
+                 ox, oy, oz = face.plane_origin
+                 ux, uy, uz = face.plane_x
+                 vx, vy, vz = face.plane_y
+                 center = np.array([
+                     ox + c2d.x * ux + c2d.y * vx,
+                     oy + c2d.x * uy + c2d.y * vy,
+                     oz + c2d.x * uz + c2d.y * vz
+                 ], dtype=float)
 
-        def world_to_display(pt):
-            self.plotter.renderer.SetWorldPoint(pt[0], pt[1], pt[2], 1.0)
-            self.plotter.renderer.WorldToDisplay()
-            d_pt = self.plotter.renderer.GetDisplayPoint()
-            return np.array([d_pt[0], self.plotter.interactor.height() - d_pt[1]])
+            # VTK Koordinaten-Transformation
+            renderer = self.plotter.renderer
+            
+            def to_screen(pt_3d):
+                renderer.SetWorldPoint(pt_3d[0], pt_3d[1], pt_3d[2], 1.0)
+                renderer.WorldToDisplay()
+                disp = renderer.GetDisplayPoint()
+                # VTK Y ist invertiert (0 ist unten), Qt Y (0 ist oben)
+                # Wir brauchen hier Vektoren, also ist die absolute Y Position egal,
+                # aber die Richtung muss stimmen (-Y).
+                return np.array([disp[0], disp[1]])
 
-        p_start = world_to_display(center)
-        p_end = world_to_display(center + normal * 10.0)
-        vec = p_end - p_start
-        
-        norm = np.linalg.norm(vec)
-        if norm < 0.1:
-            self._drag_screen_vector = np.array([1.0, 0.0])
-        else:
-            self._drag_screen_vector = vec / norm
+            p1 = to_screen(center)
+            p2 = to_screen(center + normal * 10.0) # 10 Einheiten entlang Normale
+            
+            vec = p2 - p1
+            
+            # Invertiere Y für Qt-Screen-Space (Mausbewegung ist in Qt-Coords)
+            # Da VTK 0 unten hat und Qt 0 oben, zeigt ein positiver VTK-Y Vektor nach OBEN.
+            # Im Qt Screen ist das negatives Y. 
+            # Aber wir wollen, dass Maus nach OBEN (negatives Qt Y) -> Extrude positiv.
+            # Das passt sich meist automatisch an, aber wir normalisieren es hier.
+            vec[1] = -vec[1] 
+
+            length = np.linalg.norm(vec)
+            
+            if length < 1.0:
+                # Vektor zu kurz (wir schauen direkt drauf) -> Standard Y-Achse
+                self._drag_screen_vector = np.array([0.0, -1.0])
+            else:
+                self._drag_screen_vector = vec / length
+                
+        except Exception as e:
+            print(f"Drag Vector Calc Error: {e}")
+            # Fallback: Immer vertikal ziehen lassen
+            self._drag_screen_vector = np.array([0.0, -1.0])
 
     
     def is_body_visible(self, body_id):
@@ -996,14 +1029,16 @@ class PyVistaViewport(QWidget):
     def set_extrude_mode(self, enabled):
         """Aktiviert den Modus und stellt sicher, dass der Detector visualisiert wird."""
         self.extrude_mode = enabled
-        self.selected_face_ids.clear()
-        self._drag_screen_vector = np.array([1.0, 0.0]) 
         
+        # Reset Selection beim Start
         if enabled:
-            # WICHTIG: Wir müssen sicherstellen, dass wir etwas zum Anzeigen haben
+            self.selected_face_ids.clear()
+            self._drag_screen_vector = np.array([0.0, -1.0]) 
+            # Zeichnen anstoßen (initial leer, da nichts selektiert)
             self._draw_selectable_faces_from_detector()
             self.plotter.render()
         else:
+            self.selected_face_ids.clear()
             self._clear_face_actors()
             self._clear_preview()
             self.plotter.render()
@@ -1024,37 +1059,49 @@ class PyVistaViewport(QWidget):
     
 
     def _draw_selectable_faces_from_detector(self):
-        """Zeichnet ALLE vom Detector gefundenen Flächen (Visualisierung)"""
+        """
+        PERFORMANCE FIX:
+        Zeichnet NUR die aktuell selektierten Flächen und die gehoverte Fläche.
+        Zeichnet NICHT mehr alle 60+ Kandidaten als transparente Overlays,
+        da dies bei komplexen Modellen extrem laggt.
+        """
         self._clear_face_actors()
         
-        # Wir iterieren über alle gefundenen Flächen im Detector
+        # 1. Sammle relevante IDs (Selected + Hovered)
+        relevant_ids = set(self.selected_face_ids)
+        if getattr(self, 'hover_face_id', -1) != -1:
+            relevant_ids.add(self.hover_face_id)
+            
+        if not relevant_ids:
+            # Nichts zu tun, Render nur erzwingen um alte zu löschen
+            self.plotter.render()
+            return
+            
+        # 2. Nur relevante zeichnen
         for face in self.detector.selection_faces:
-            
-            # Status ermitteln
+            if face.id not in relevant_ids:
+                continue
+                
             is_selected = face.id in self.selected_face_ids
-            is_hovered = (face.id == getattr(self, 'hover_face_id', -1))
+            is_hovered = face.id == getattr(self, 'hover_face_id', -1)
             
-            # Farbe und Transparenz basierend auf Status
+            # Farbe und Transparenz
             if is_selected:
                 color = 'orange'
                 opacity = 0.8
             elif is_hovered:
-                color = '#44aaff' # Hellblau bei Mouseover
+                color = '#44aaff' # Hellblau
                 opacity = 0.6
             else:
-                color = 'cyan'    # Standardfarbe für wählbare Flächen
-                opacity = 0.3     # Etwas transparenter
+                continue
             
             if face.display_mesh:
                 name = f"det_face_{face.id}"
                 
-                # Kleiner Offset in Normalenrichtung gegen Z-Fighting
-                # (damit das Selection-Mesh nicht IN der Skizzen-Linie flackert)
+                # Kleiner Offset gegen Z-Fighting
                 offset = np.array(face.plane_normal) * 0.05
                 shifted = face.display_mesh.translate(offset, inplace=False)
                 
-                # WICHTIG: pickable=False, da das Picking über den Detector (Mathematik) läuft,
-                # nicht über die PyVista-Actors. Diese Actors sind rein visuell!
                 self.plotter.add_mesh(
                     shifted, 
                     color=color, 
@@ -1840,25 +1887,21 @@ class PyVistaViewport(QWidget):
     
     def pick(self, ray_origin, ray_dir, selection_filter=None):
         """
-        Zentrale Pick-Methode. 
-        Leitet den Strahl an den Detector weiter und gibt die getroffene Face-ID zurück.
+        Robuste Pick-Methode mit Safety-Check für Datentypen.
         """
-        # Fallback, falls kein Filter übergeben wurde
         if selection_filter is None:
              from gui.geometry_detector import GeometryDetector
              selection_filter = GeometryDetector.SelectionFilter.ALL
 
         hits = []
+        ray_start = np.array(ray_origin)
+        ray_end = ray_start + np.array(ray_dir) * 10000.0
         
-        # Wir fragen den Detector nach Treffern
-        # (Die Logik liegt jetzt sauber getrennt im Detector, nicht mehr hier im Viewport Code)
-        
-        # 1. Iteriere über alle bekannten Flächen im Detector
         for face in self.detector.selection_faces:
             if face.domain_type not in selection_filter:
                 continue
 
-            # A) Sketch-Faces (Analytisch schneiden)
+            # A) Sketch-Faces
             if face.domain_type.startswith("sketch"):
                 hit = self.detector._intersect_ray_plane(
                     ray_origin, ray_dir,
@@ -1867,33 +1910,41 @@ class PyVistaViewport(QWidget):
                 )
                 if hit is None: continue
 
-                # 3D Punkt in 2D Sketch-Koordinaten umrechnen
                 x, y = self.detector._project_point_2d(
                     hit, face.plane_origin, face.plane_x, face.plane_y
                 )
 
-                # Prüfen ob Punkt im Polygon liegt (Shapely)
                 if face.shapely_poly.contains(Point(x, y)):
-                    dist = np.linalg.norm(np.array(hit) - np.array(ray_origin))
+                    dist = np.linalg.norm(np.array(hit) - ray_start)
                     hits.append((face.pick_priority, dist, face.id))
 
-            # B) Body-Faces (Mesh Raytrace)
+            # B) Body-Faces
             elif face.domain_type == "body_face":
-                if face.display_mesh:
-                    # PyVista Raytrace nutzen
-                    pts, _ = face.display_mesh.ray_trace(
-                        ray_origin, np.array(ray_origin) + np.array(ray_dir) * 10000
-                    )
-                    if len(pts) > 0:
-                        dist = np.linalg.norm(pts[0] - ray_origin)
-                        hits.append((face.pick_priority, dist, face.id))
+                mesh = face.display_mesh
+                if mesh:
+                    # SAFETY FIX: Falls mesh kein ray_trace hat (UnstructuredGrid), konvertieren
+                    if not hasattr(mesh, 'ray_trace'):
+                         try:
+                             # Versuchen zu konvertieren und cachen
+                             mesh = mesh.extract_surface()
+                             face.display_mesh = mesh 
+                         except:
+                             continue
+
+                    if mesh.n_points < 3: continue
+                    
+                    try:
+                        pts, _ = mesh.ray_trace(ray_start, ray_end)
+                        if len(pts) > 0:
+                            dist = np.linalg.norm(pts[0] - ray_start)
+                            hits.append((face.pick_priority, dist, face.id))
+                    except Exception as e:
+                        # Ignoriere Fehler beim Raytracing einzelner Faces
+                        pass
 
         if not hits: return -1
         
-        # Sortieren: Höchste Priorität zuerst (z.B. Loch vor Fläche), dann geringste Distanz
         hits.sort(key=lambda h: (-h[0], h[1]))
-        
-        # ID des besten Treffers zurückgeben
         return hits[0][2]
         
         

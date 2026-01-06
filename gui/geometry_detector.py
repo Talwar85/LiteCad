@@ -412,37 +412,67 @@ class GeometryDetector:
         if 'Normals' not in vtk_mesh.cell_data:
             vtk_mesh.compute_normals(cell_normals=True, inplace=True)
 
+        if not vtk_mesh.is_all_triangles:
+            vtk_mesh = vtk_mesh.triangulate()
+
         normals = np.round(vtk_mesh.cell_data['Normals'], 3)
         unique_normals, groups = np.unique(normals, axis=0, return_inverse=True)
 
         for group_idx, normal in enumerate(unique_normals):
             cell_ids = np.where(groups == group_idx)[0]
-            group_mesh = vtk_mesh.extract_cells(cell_ids)
-
-            regions = group_mesh.connectivity(extraction_mode='all')
-            region_ids = regions.get_array("RegionId")
-            if region_ids is None:
+            
+            if len(cell_ids) < 1: 
                 continue
 
-            for rid in range(int(region_ids.max()) + 1):
-                region = regions.threshold([rid, rid], scalars="RegionId").extract_surface()
-                if region.n_points == 0:
+            # Das hier ist ein UnstructuredGrid
+            group_mesh_ugrid = vtk_mesh.extract_cells(cell_ids)
+            
+            # WICHTIG: Sofort in PolyData (Surface) wandeln für ray_trace Support!
+            group_mesh = group_mesh_ugrid.extract_surface()
+
+            try:
+                # Connectivity Check
+                conn = group_mesh.connectivity(extraction_mode='all')
+                n_regions = conn.n_regions
+                
+                if n_regions < 1:
+                    # Fallback: Alles nehmen
+                    if group_mesh.n_points >= 3:
+                        center = np.mean(group_mesh.points, axis=0)
+                        self._add_body_face(body_id, center, normal, group_mesh)
                     continue
 
-                center = np.mean(region.points, axis=0)
+                for i in range(n_regions):
+                    region = conn.threshold([i, i], scalars='RegionId')
+                    
+                    # Auch hier sicherstellen, dass wir Surface haben
+                    region_surf = region.extract_surface()
+                    
+                    if region_surf.n_points < 3:
+                        continue
+                    
+                    center = np.mean(region_surf.points, axis=0)
+                    self._add_body_face(body_id, center, normal, region_surf)
 
-                face = SelectionFace(
-                    id=self._counter,
-                    owner_id=body_id,
-                    domain_type="body_face",
-                    plane_origin=tuple(center),
-                    plane_normal=tuple(normal),
-                    pick_priority=5,
-                    display_mesh=region
-                )
+            except Exception as e:
+                print(f"Connectivity Warning: {e}")
+                # Fallback bei Fehler: Das bereits konvertierte group_mesh nutzen
+                if group_mesh.n_points >= 3:
+                    center = np.mean(group_mesh.points, axis=0)
+                    self._add_body_face(body_id, center, normal, group_mesh)
 
-                self.selection_faces.append(face)
-                self._counter += 1
+    def _add_body_face(self, body_id, center, normal, mesh):
+        face = SelectionFace(
+            id=self._counter,
+            owner_id=body_id,
+            domain_type="body_face",
+            plane_origin=tuple(center),
+            plane_normal=tuple(normal),
+            pick_priority=5,
+            display_mesh=mesh 
+        )
+        self.selection_faces.append(face)
+        self._counter += 1
 
     def detect_edges(self, body_id, vtk_mesh):
         """Erkennt Kanten für Fillet/Chamfer"""
