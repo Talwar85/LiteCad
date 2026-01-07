@@ -5,6 +5,7 @@ Robust B-Rep Implementation with Build123d & Smart Failure Recovery
 """
 
 from dataclasses import dataclass, field
+import tempfile
 from typing import List, Optional, Tuple, Union
 from enum import Enum, auto
 import math
@@ -23,6 +24,7 @@ except ImportError:
 # WICHTIG: Unser neuer Helper
 from modeling.cad_tessellator import CADTessellator
 from modeling.mesh_converter import MeshToBREPConverter # NEU
+from modeling.mesh_converter_functional_parts import MeshToBREPV5 # NEU
 
 
 # ==================== IMPORTS ====================
@@ -162,10 +164,10 @@ class Body:
             self.features.remove(feature)
             self._rebuild()
             
-    def convert_to_brep(self):
+    def convert_to_brep(self, mode: str = "v1"):
         """
-        Versucht, die aktuellen Mesh-Daten in ein echtes CAD-BREP umzuwandeln.
-        Dies ermöglicht Boolesche Operationen und präzise Schnitte.
+        Wandelt Mesh in CAD-Solid um.
+        :param mode: 'v1' (Schnell/Slicing/Sewing) oder 'v5' (Reverse Engineering/Rundungen)
         """
         if self._build123d_solid is not None:
             logger.info(f"Body '{self.name}' ist bereits BREP.")
@@ -175,24 +177,56 @@ class Body:
             logger.warning("Keine Mesh-Daten vorhanden.")
             return False
 
-        converter = MeshToBREPConverter()
-        
-        # Wir zielen auf 2000-5000 Faces, damit OCP nicht abstürzt
-        # FIX: Parameter 'smooth' entfernt, stattdessen 'method="auto"' genutzt
-        solid = converter.convert(self.vtk_mesh, target_faces=3000, method="auto")
+        solid = None
 
-        if solid:
+        # --- MODUS V5: THE DETAILER (Reverse Engineering) ---
+        if mode == "v5":
+            logger.info("Starte Konvertierung mit V5 (Detailer & RANSAC)...")
+            try:
+                converter = MeshToBREPV5()
+                
+                # Brücke: PyVista (Memory) -> Temporäre Datei -> Open3D (V5)
+                # Wir nutzen .ply, das speichert Koordinaten präzise
+                with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as tmp:
+                    temp_path = tmp.name
+                
+                try:
+                    self.vtk_mesh.save(temp_path)
+                    # V5 aufrufen
+                    solid = converter.convert(temp_path)
+                finally:
+                    # Aufräumen
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+
+            except Exception as e:
+                logger.error(f"V5 Konvertierung fehlgeschlagen: {e}")
+                traceback.print_exc()
+                return False
+
+        # --- MODUS V1: CLASSIC / SEWING ---
+        else: # v1 oder auto
+            logger.info("Starte Konvertierung mit V1 (Sewing/Slicing)...")
+            try:
+                converter = MeshToBREPConverter()
+                # Wir zielen auf 2000-5000 Faces, damit OCP nicht abstürzt
+                solid = converter.convert(self.vtk_mesh, target_faces=3000, method="auto")
+            except Exception as e:
+                logger.error(f"V1 Konvertierung fehlgeschlagen: {e}")
+                return False
+
+        # --- ERGEBNIS VERARBEITEN ---
+        if solid and hasattr(solid, 'wrapped') and not solid.wrapped.IsNull():
             self._build123d_solid = solid
             self.shape = solid.wrapped
             
-            # Wichtig: Ein Feature hinzufügen, damit der Browser Bescheid weiß
-            # Wir nutzen ein Dummy-Feature, damit Rebuilds funktionieren (oder wir löschen die Mesh-History)
-            logger.success(f"Body '{self.name}' erfolgreich zu BREP konvertiert.")
+            logger.success(f"Body '{self.name}' erfolgreich mit [{mode.upper()}] konvertiert.")
             
             # Mesh neu berechnen (diesmal vom BREP abgeleitet für Konsistenz)
             self._update_mesh_from_solid(solid)
             return True
         else:
+            logger.warning(f"Konvertierung mit [{mode.upper()}] lieferte kein gültiges Solid.")
             return False
             
     def _safe_operation(self, op_name, op_func, fallback_func=None):

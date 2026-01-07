@@ -821,47 +821,89 @@ class MainWindow(QMainWindow):
             print(f"Unbekannte 3D-Aktion: {action}")
             
     def _convert_selected_body_to_brep(self):
-        from PySide6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication, QMessageBox, QInputDialog
+        from PySide6.QtCore import Qt
 
         body = self._get_active_body()
         if not body: 
             self.statusBar().showMessage("Kein Körper ausgewählt.")
             return
 
-        self.statusBar().showMessage(f"Konvertiere '{body.name}' zu BREP (bitte warten)...")
+        # --- NEU: Parameter-Abfrage ---
+        options = [
+            "V1: Standard (Schnell, Sewing - für saubere Meshes)",
+            "V5: Reverse Engineering (Smart - für 3D Scans, Rundungen & Löcher)"
+        ]
         
-        # 1. UI kurz updaten lassen, damit der User die Nachricht sieht
+        # Dialog anzeigen
+        item, ok = QInputDialog.getItem(
+            self, 
+            "Konvertierungsmethode wählen", 
+            "Strategie:", 
+            options, 
+            0, # Standard-Auswahl (Index 0 = V1)
+            False # Nicht editierbar
+        )
+
+        if not ok or not item:
+            return # Nutzer hat Abbrechen geklickt
+
+        # Auswahl in technischen Parameter übersetzen
+        mode_param = "v1"
+        if "V5" in item:
+            mode_param = "v5"
+        # ------------------------------
+
+        self.statusBar().showMessage(f"Konvertiere '{body.name}' mit [{mode_param.upper()}] (bitte warten)...")
+        
+        # UI updaten und Cursor auf "Warten" setzen (da V5 dauern kann)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         QApplication.processEvents() 
 
-        # 2. Konvertierung starten
-        success = body.convert_to_brep()
-        
-        if success:
-            self.statusBar().showMessage(f"Erfolg! '{body.name}' ist jetzt ein CAD-Solid.")
+        try:
+            # 2. Konvertierung starten (mit Parameter!)
+            success = body.convert_to_brep(mode=mode_param)
             
-            # 3. Browser aktualisieren (Icons ändern sich evtl.)
-            self.browser.refresh()
-            
-            # 4. VIEWPORT FIX: 
-            # Wir entfernen den Body explizit, um sicherzugehen, dass keine Reste bleiben
-            if body.id in self.viewport_3d._body_actors:
-                for actor_name in self.viewport_3d._body_actors[body.id]:
-                    try:
-                        self.viewport_3d.plotter.remove_actor(actor_name)
-                    except: pass
-            
-            # 5. Komplettes Neu-Laden aller sichtbaren Objekte anstoßen
-            # Wir rufen direkt die Implementierung auf, um den Timer zu umgehen
-            self._update_viewport_all_impl()
-            
-            # 6. Erzwinge das Rendern sofort
-            if hasattr(self.viewport_3d, 'plotter'):
-                self.viewport_3d.plotter.render()
-                self.viewport_3d.update() # Qt Widget update
-            
-        else:
-            QMessageBox.warning(self, "Fehler", "Konvertierung fehlgeschlagen.\nIst MeshLab (pymeshlab) installiert?")
-            self.statusBar().showMessage("Konvertierung fehlgeschlagen.")
+            if success:
+                self.statusBar().showMessage(f"Erfolg! '{body.name}' ist jetzt ein CAD-Solid.")
+                
+                # 3. Browser aktualisieren
+                self.browser.refresh()
+                
+                # 4. VIEWPORT FIX: Alte Darstellung entfernen
+                if body.id in self.viewport_3d._body_actors:
+                    for actor_name in self.viewport_3d._body_actors[body.id]:
+                        try:
+                            self.viewport_3d.plotter.remove_actor(actor_name)
+                        except: pass
+                
+                # 5. Neu laden
+                self._update_viewport_all_impl()
+                
+                # 6. Rendern erzwingen
+                if hasattr(self.viewport_3d, 'plotter'):
+                    self.viewport_3d.plotter.render()
+                    self.viewport_3d.update()
+                
+            else:
+                QApplication.restoreOverrideCursor() # Cursor zurücksetzen vor der Box
+                error_msg = "Unbekannter Fehler."
+                if mode_param == "v5":
+                    error_msg = "V5 Reverse Engineering fehlgeschlagen.\nSind Open3D/RANSAC installiert und das Mesh sauber?"
+                else:
+                    error_msg = "Standard-Konvertierung fehlgeschlagen.\nIst das Mesh geschlossen?"
+                
+                QMessageBox.warning(self, "Fehler", error_msg)
+                self.statusBar().showMessage("Konvertierung fehlgeschlagen.")
+
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Absturz", f"Kritischer Fehler bei Konvertierung: {e}")
+            traceback.print_exc()
+
+        finally:
+            # WICHTIG: Cursor immer zurücksetzen, auch bei Fehlern
+            QApplication.restoreOverrideCursor()
             
     def _show_not_implemented(self, feature: str):
         """Zeigt Hinweis für noch nicht implementierte Features"""
