@@ -11,3 +11,4 @@ meshlib
 pyransac3d
 open3d
 scipy
+alphashape

@@ -49,7 +49,7 @@ except ImportError:
 
 class MeshToBREPV5:
     
-    def __init__(self, debug=False):
+    def __init__(self, debug=True):
         self.debug = debug
         if debug:
             logger.add("mesh_v34_final.log", level="INFO", mode="w")
