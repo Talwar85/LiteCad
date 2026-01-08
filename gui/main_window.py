@@ -1106,34 +1106,61 @@ class MainWindow(QMainWindow):
     
     def _on_plane_selected(self, plane):
         self.viewport_3d.set_plane_select_mode(False)
-        origins = {'xy':((0,0,0),(0,0,1)), 'xz':((0,0,0),(0,1,0)), 'yz':((0,0,0),(1,0,0))}
-        o, n = origins.get(plane, ((0,0,0),(0,0,1)))
-        self._create_sketch_at(o, n)
+        
+        # DEFINITION: (Origin, Normal, X_Direction)
+        # Damit legen wir fest, wo "Rechts" und "Oben" auf dem Bildschirm ist.
+        plane_defs = {
+            'xy': ((0,0,0), (0,0,1), (1,0,0)), # Boden: Z hoch, X rechts
+            'xz': ((0,0,0), (0,1,0), (1,0,0)), # Vorne: Y hinten, X rechts (Standard CAD "Front")
+            'yz': ((0,0,0), (1,0,0), (0,1,0))  # Rechts: X rechts, Y hoch (Standard CAD "Right")
+        }
+        
+        # Standardwerte falls was schiefgeht
+        default = ((0,0,0), (0,0,1), (1,0,0))
+        
+        origin, normal, x_dir = plane_defs.get(plane, default)
+        
+        # Wir nutzen die neue Logik mit x_dir_override
+        self._create_sketch_at(origin, normal, x_dir_override=x_dir)
 
     def _on_custom_plane_selected(self, origin, normal):
         self.viewport_3d.set_plane_select_mode(False)
-        self._create_sketch_at(origin, normal)
+        
+        # NEU: Versuchen, die stabile X-Achse vom Viewport zu holen
+        x_dir = getattr(self.viewport_3d, '_last_picked_x_dir', None)
+        
+        self._create_sketch_at(origin, normal, x_dir)
 
-    def _create_sketch_at(self, origin, normal):
+    def _create_sketch_at(self, origin, normal, x_dir_override=None):
         s = self.document.new_sketch(f"Sketch{len(self.document.sketches)+1}")
         
-        # Berechne die lokalen Achsen, damit Viewport und Build123d synchron sind
-        x_dir, y_dir = self._calculate_plane_axes(normal)
+        # Berechne Achsen
+        if x_dir_override:
+            # PERFEKT: Wir haben eine stabile Achse vom Detector
+            x_dir = x_dir_override
+            # Y berechnen (Kreuzprodukt)
+            import numpy as np
+            n_vec = np.array(normal)
+            x_vec = np.array(x_dir)
+            y_vec = np.cross(n_vec, x_vec)
+            y_dir = tuple(y_vec)
+        else:
+            # Fallback: Raten (das was bisher Probleme machte)
+            x_dir, y_dir = self._calculate_plane_axes(normal)
         
-        # Speichere ALLE Orientierungsdaten im Sketch Objekt
+        # Speichere ALLES im Sketch
         s.plane_origin = origin
         s.plane_normal = normal
-        s.plane_x_dir = x_dir # WICHTIG für Build123d
+        s.plane_x_dir = x_dir  # <--- Das ist der Schlüssel zum Erfolg
         s.plane_y_dir = y_dir
         
         self.active_sketch = s
         self.sketch_editor.sketch = s
         
-        # Bodies als Referenz an SketchEditor übergeben
+        # Bodies als Referenz übergeben (für Snapping auf Kanten)
         self._set_sketch_body_references(origin, normal)
         
         self._set_mode("sketch")
-        
         self.browser.refresh()
     
     def _set_sketch_body_references(self, origin, normal):

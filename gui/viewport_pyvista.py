@@ -768,47 +768,46 @@ class PyVistaViewport(QWidget):
 
     # ==================== PICKING ====================
     def _highlight_plane_at_position(self, x, y):
+        """
+        Kombiniert Standard-Ebenen Highlight mit GeometryDetector Highlight.
+        Ersetzt den 'grünen Kreis' durch echte Flächen-Hervorhebung.
+        """
         if not self._plane_actors: return
-        try:
-            height = self.plotter.interactor.height()
-            
-            # Erst Standard-Ebenen prüfen
-            picker = vtk.vtkPropPicker()
-            picker.Pick(x, height-y, 0, self.plotter.renderer)
-            actor = picker.GetActor()
-            found = None
-            if actor:
-                for k, v in self._plane_actors.items():
-                    if self.plotter.renderer.actors.get(v) == actor: found = k; break
-            
-            # Standard-Ebenen Highlight
-            if found != self.last_highlighted_plane:
-                self.last_highlighted_plane = found
-                for k in ['xy','xz','yz']:
-                    self._set_opacity(k, 0.7 if k == found else 0.25)
-            
-            # Body-Flächen Highlight
-            if found is None and self.bodies:
-                cell_picker = vtk.vtkCellPicker()
-                cell_picker.SetTolerance(0.01)
-                if cell_picker.Pick(x, height-y, 0, self.plotter.renderer):
-                    cell_id = cell_picker.GetCellId()
-                    if cell_id != -1:
-                        pos = cell_picker.GetPickPosition()
-                        normal = cell_picker.GetPickNormal()
-                        new_hover = (tuple(pos), tuple(normal))
-                        if getattr(self, '_plane_hover', None) != new_hover:
-                            self._plane_hover = new_hover
-                            self._draw_plane_hover_highlight(pos, normal)
-                        return
-            
-            # Kein Body-Face getroffen - Highlight entfernen
-            if getattr(self, '_plane_hover', None) is not None:
-                self._plane_hover = None
-                self._clear_plane_hover_highlight()
-            
+        
+        height = self.plotter.interactor.height()
+        
+        # 1. Standard-Ebenen prüfen (XY, XZ, YZ) - die bleiben wie sie sind
+        import vtk
+        picker = vtk.vtkPropPicker()
+        picker.Pick(x, height-y, 0, self.plotter.renderer)
+        actor = picker.GetActor()
+        found_std_plane = None
+        
+        if actor:
+            for k, v in self._plane_actors.items():
+                if self.plotter.renderer.actors.get(v) == actor: 
+                    found_std_plane = k; break
+        
+        # Standard-Ebenen Highlight setzen
+        if found_std_plane != self.last_highlighted_plane:
+            self.last_highlighted_plane = found_std_plane
+            for k in ['xy','xz','yz']:
+                self._set_opacity(k, 0.7 if k == found_std_plane else 0.25)
             self.plotter.render()
-        except: pass
+
+        # 2. Wenn keine Standard-Ebene, prüfe auf Body-Flächen via Detector
+        # (Nur wenn wir nicht gerade über einer Standardebene hovern)
+        new_hover_id = -1
+        
+        if found_std_plane is None:
+            # Nutze die intelligente Pick-Logik
+            new_hover_id = self.pick(x, y, selection_filter={"body_face"})
+        
+        # Nur neu zeichnen wenn sich was geändert hat
+        if new_hover_id != getattr(self, 'hover_face_id', -1):
+            self.hover_face_id = new_hover_id
+            # Nutzt die gleiche Methode wie Extrude -> Blaue Fläche!
+            self._draw_selectable_faces_from_detector()
     
     def _draw_plane_hover_highlight(self, pos, normal):
         """Zeichnet Highlight für Body-Fläche im Plane-Select-Modus"""
@@ -859,40 +858,55 @@ class PyVistaViewport(QWidget):
         except: pass
 
     def _pick_plane_at_position(self, x, y):
-        """Prüft, ob eine Standard-Ebene oder eine Body-Fläche geklickt wurde."""
+        """
+        Wählt die Ebene aus.
+        Priorität: 1. Standard-Ebenen, 2. Body-Flächen (via Detector)
+        """
         import vtk
-        try:
-            height = self.plotter.interactor.height()
-            
-            # 1. Standard-Ebenen (XY, XZ, YZ) prüfen
-            picker = vtk.vtkPropPicker()
-            picker.Pick(x, height - y, 0, self.plotter.renderer)
-            actor = picker.GetActor()
-            
-            if actor:
-                for name, actor_name in self._plane_actors.items():
-                    if self.plotter.renderer.actors.get(actor_name) == actor:
-                        # Signal für Standard-Ebene senden
-                        self.plane_clicked.emit(name)
-                        return
+        height = self.plotter.interactor.height()
+        
+        # 1. Standard-Ebenen (XY, XZ, YZ)
+        picker = vtk.vtkPropPicker()
+        picker.Pick(x, height - y, 0, self.plotter.renderer)
+        actor = picker.GetActor()
+        
+        if actor:
+            for name, actor_name in self._plane_actors.items():
+                if self.plotter.renderer.actors.get(actor_name) == actor:
+                    self.plane_clicked.emit(name)
+                    return
 
-            # 2. Body-Flächen prüfen (Custom Plane)
-            cell_picker = vtk.vtkCellPicker()
-            cell_picker.SetTolerance(0.005)
-            if cell_picker.Pick(x, height - y, 0, self.plotter.renderer):
-                pos = cell_picker.GetPickPosition()
-                normal = cell_picker.GetPickNormal()
-                if pos and normal:
-                    # Bereinigung der Normalen für präzise CAD-Ausrichtung
-                    nx, ny, nz = normal
-                    if abs(abs(nx)-1) < 0.05: normal = (1 if nx>0 else -1, 0, 0)
-                    elif abs(abs(ny)-1) < 0.05: normal = (0, 1 if ny>0 else -1, 0)
-                    elif abs(abs(nz)-1) < 0.05: normal = (0, 0, 1 if nz>0 else -1)
-                    
-                    # Signal für Fläche auf Body senden
-                    self.custom_plane_clicked.emit(tuple(pos), tuple(normal))
-        except Exception as e:
-            print(f"Error picking plane: {e}")
+        # 2. Body-Flächen via Detector (Das ist die Verbesserung!)
+        # Wir nutzen das Ergebnis vom Hover, oder picken neu
+        face_id = self.pick(x, y, selection_filter={"body_face"})
+        
+        if face_id != -1:
+            # Face Objekt holen
+            face = next((f for f in self.detector.selection_faces if f.id == face_id), None)
+            if face:
+                print(f"Sketch Plane gewählt: Face {face.id} auf Body {face.owner_id}")
+                
+                # Sende Origin und Normal
+                self.custom_plane_clicked.emit(
+                    face.plane_origin, 
+                    face.plane_normal
+                )
+                
+                # Speichere die stabile X-Achse für Schritt 2 (siehe vorherige Antwort)
+                self._last_picked_x_dir = face.plane_x
+                return
+
+    def _update_detector_for_picking(self):
+        """Lädt alle sichtbaren Body-Meshes in den Detector"""
+        if not hasattr(self, 'detector'): return
+        
+        # Detector leeren
+        self.detector.clear()
+        
+        # Nur Bodies laden (Sketches brauchen wir nicht um darauf zu sketchen)
+        for bid, body in self.bodies.items():
+            if self.is_body_visible(bid) and 'mesh' in body:
+                self.detector.process_body_mesh(bid, body['mesh'])
             
    
         
@@ -1053,13 +1067,25 @@ class PyVistaViewport(QWidget):
     def set_plane_select_mode(self, enabled):
         self.plane_select_mode = enabled
         self.last_highlighted_plane = None
-        self._plane_hover = None
+        
+        # Reset Hover
+        self.hover_face_id = -1
+        self.selected_face_ids.clear()
+        
         if enabled: 
             self._show_selection_planes()
+            
+            # WICHTIG: Detector mit Geometrie füllen, genau wie beim Extrude!
+            # Wir nutzen die Hilfsfunktion, um nicht alles doppelt zu schreiben
+            self._update_detector_for_picking()
+            
             self.plotter.render()
         else: 
             self._hide_selection_planes()
-            self._clear_plane_hover_highlight()
+            # Aufräumen
+            self._clear_face_actors()
+            self._clear_plane_hover_highlight() # Alte Visualisierung löschen
+            self.plotter.render()
 
     def set_extrude_mode(self, enabled):
         """Aktiviert den Modus und stellt sicher, dass der Detector visualisiert wird."""
@@ -2276,30 +2302,23 @@ class PyVistaViewport(QWidget):
         norm = tuple(getattr(s,'plane_normal',(0,0,1)))
         orig = getattr(s,'plane_origin',(0,0,0))
         
-        # OPTIMIERUNG: Wenn X-Achse im Sketch gespeichert ist, nutze diese direkt!
-        # Das garantiert, dass das Grid im Viewport genau so liegt wie die Build123d Plane.
-        x_dir_cached = getattr(s, 'plane_x_dir', None)
+        # FIX: Wenn wir eine gespeicherte X-Achse haben, NUTZEN wir sie!
+        # Das verhindert, dass die Skizze sich dreht.
+        cached_x = getattr(s, 'plane_x_dir', None)
+        cached_y = getattr(s, 'plane_y_dir', None)
         
         sid = getattr(s,'id',id(s))
         
         # Lokale Funktion mit Closure über Koordinatensystem
         def t3d(x, y): 
-            if x_dir_cached:
-                # Schnelle Berechnung ohne Neuberechnung der Achsen
-                ux = x_dir_cached
-                # Berechne Y aus Normal und X (Kreuzprodukt)
-                n_np = np.array(norm)
-                x_np = np.array(ux)
-                uy = np.cross(n_np, x_np) # Y Vektor
-                
-                ox, oy, oz = orig
-                # P = O + x*U + y*V
-                px = ox + x * ux[0] + y * uy[0]
-                py = oy + x * ux[1] + y * uy[1]
-                pz = oz + x * ux[2] + y * uy[2]
+            if cached_x and cached_y:
+                # Exakte Transformation: P = Origin + x*X_Axis + y*Y_Axis
+                px = orig[0] + x * cached_x[0] + y * cached_y[0]
+                py = orig[1] + x * cached_x[1] + y * cached_y[1]
+                pz = orig[2] + x * cached_x[2] + y * cached_y[2]
                 return (px, py, pz)
             else:
-                # Fallback zur alten Berechnung
+                # Fallback zur alten Berechnung (Raten)
                 return self._transform_2d_to_3d(x, y, norm, orig)
         
         # Linien
