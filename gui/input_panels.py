@@ -37,6 +37,7 @@ class ExtrudeInputPanel(QFrame):
     """Input panel for extrude operation"""
     
     height_changed = Signal(float)
+    direction_flipped = Signal()
     confirmed = Signal()
     cancelled = Signal()
     bodies_visibility_toggled = Signal(bool)
@@ -45,7 +46,7 @@ class ExtrudeInputPanel(QFrame):
         super().__init__(parent)
         self._height = 0.0
         self._bodies_hidden = False
-        
+        self._direction = 1  # 1 or -1
         self.setMinimumWidth(520)
         self.setFixedHeight(60)
         
@@ -94,6 +95,30 @@ class ExtrudeInputPanel(QFrame):
         self.op_combo.addItems(["New Body", "Join", "Cut", "Intersect"])
         layout.addWidget(self.op_combo)
 
+        # Flip Direction Button
+        self.flip_btn = QPushButton("⇅")
+        self.flip_btn.setToolTip("Richtung umkehren (F)")
+        self.flip_btn.setFixedSize(32, 32)
+        self.flip_btn.setStyleSheet("""
+            QPushButton {
+                background: #3a3a3a;
+                border: 1px solid #4a4a4a;
+                border-radius: 3px;
+                color: #ccc;
+                font-size: 16px;
+            }
+            QPushButton:hover {
+                background: #4a4a4a;
+                color: #fff;
+            }
+            QPushButton:pressed {
+                background: #0078d4;
+            }
+        """)
+        self.flip_btn.clicked.connect(self._flip_direction)
+        layout.addWidget(self.flip_btn)
+        
+        
         self.btn_vis = QPushButton("👁")
         self.btn_vis.setCheckable(True)
         self.btn_vis.setFixedWidth(35)
@@ -114,17 +139,33 @@ class ExtrudeInputPanel(QFrame):
         self.hide()
 
     def set_height(self, h):
+        """Setzt den Wert von außen (z.B. durch Ziehen im Viewport)"""
         self.height_input.blockSignals(True)
         self.height_input.setValue(h)
         self.height_input.blockSignals(False)
         self._height = h
+        # Richtungssymbol basierend auf Vorzeichen aktualisieren
+        self._direction = 1 if h >= 0 else -1
 
     def get_height(self):
         return self.height_input.value()
 
     def get_operation(self) -> str:
         return self.op_combo.currentText()
-
+    
+    def _flip_direction(self):
+        """Invertiert das Vorzeichen des aktuellen Wertes"""
+        current_val = self.height_input.value()
+        new_val = current_val * -1
+        
+        # Wir setzen den Wert direkt über die SpinBox, 
+        # das löst automatisch _on_height_changed aus.
+        self.height_input.setValue(new_val)
+        
+        # Optional: Signal explizit feuern, falls man sichergehen will
+        self.direction_flipped.emit()
+        
+        
     def reset(self):
         self._height = 0.0
         self.height_input.blockSignals(True)
