@@ -1441,7 +1441,7 @@ class PyVistaViewport(QWidget):
             self._body_actors[bid] = tuple(actors_list)
             
             # WICHTIG: Erzwinge Update direkt nach dem Hinzufügen
-            self.plotter.render()
+            #self.plotter.render()
             
         except Exception as e:
             print(f"Viewport Add Body Error: {e}")

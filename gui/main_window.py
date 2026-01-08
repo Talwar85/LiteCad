@@ -1085,7 +1085,7 @@ class MainWindow(QMainWindow):
             self.center_stack.setCurrentIndex(0)  # Viewport
             self.right_stack.setVisible(False)
             self.btn_finish_sketch.setVisible(False)
-            self._update_viewport_all()
+            #self._update_viewport_all()
         else:
             # Sketch-Modus
             self.tool_stack.setCurrentIndex(1)  # 2D-ToolPanel
